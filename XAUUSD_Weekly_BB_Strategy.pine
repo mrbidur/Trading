@@ -1,0 +1,113 @@
+// This Pine Script™ is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+
+//@version=5
+strategy("Hyper-Responsive Weekly XAUUSD System", 
+     overlay=true, 
+     default_qty_type=strategy.percent_of_equity, 
+     default_qty_value=100, 
+     initial_capital=10000, 
+     commission_type=strategy.commission.cash_per_order, 
+     commission_value=0, 
+     slippage=0,
+     calc_on_every_tick=false)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// INPUTS
+// ══════════════════════════════════════════════════════════════════════════════
+bbLength   = input.int(20, "BB Length", minval=1)
+bbMult     = input.float(1.0, "BB Std Dev Multiplier", minval=0.1, step=0.1)
+pipBuffer  = input.float(0.02, "Stop Buffer Below Structural Low (dollars)", minval=0.0, step=0.01, tooltip="Buffer below the lowest wick during lower band breach phase (equivalent to ~2 pips for XAUUSD)")
+
+// ══════════════════════════════════════════════════════════════════════════════
+// BOLLINGER BAND CALCULATIONS
+// ══════════════════════════════════════════════════════════════════════════════
+basis      = ta.sma(close, bbLength)
+dev        = bbMult * ta.stdev(close, bbLength)
+upperBand  = basis + dev
+lowerBand  = basis - dev
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PLOT BOLLINGER BANDS
+// ══════════════════════════════════════════════════════════════════════════════
+plot(basis, "SMA 20", color=color.orange, linewidth=2)
+p1 = plot(upperBand, "Upper Band (+1 SD)", color=color.blue)
+p2 = plot(lowerBand, "Lower Band (-1 SD)", color=color.blue)
+fill(p1, p2, color=color.new(color.blue, 90), title="BB Fill")
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SETUP A: MOMENTUM BREAKOUT
+// Weekly candle closes above the upper band → Long entry
+// Stop: Weekly close below the 20 SMA (center line)
+// ══════════════════════════════════════════════════════════════════════════════
+setupA_entry = close > upperBand
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SETUP B: MEAN-REVERSION PIVOT
+// Track when price breaches below the lower band, record the structural low,
+// then enter when price closes back inside/above the lower band.
+// Stop: 1-2 pips below the absolute lowest wick during the breach phase.
+// ══════════════════════════════════════════════════════════════════════════════
+var bool   inBreachPhase    = false
+var float  structuralLow    = na
+
+// Detect breach below lower band (close below lower band)
+breachBelow = close < lowerBand
+
+// Update breach tracking
+if breachBelow and not inBreachPhase
+    // Starting a new breach phase
+    inBreachPhase := true
+    structuralLow := low
+else if breachBelow and inBreachPhase
+    // Continue tracking the lowest point during breach
+    structuralLow := math.min(structuralLow, low)
+
+// Setup B triggers when price closes back inside/above the lower band after a breach
+setupB_entry = inBreachPhase and close >= lowerBand
+
+// Reset breach phase on Setup B entry
+if setupB_entry
+    inBreachPhase := false
+
+// ══════════════════════════════════════════════════════════════════════════════
+// TRADE MANAGEMENT
+// ══════════════════════════════════════════════════════════════════════════════
+var string tradeType = ""  // "A" or "B"
+var float  setupB_stop = na
+
+// Entry Logic - only enter if flat
+if strategy.position_size == 0
+    if setupA_entry
+        strategy.entry("Setup A", strategy.long)
+        tradeType := "A"
+    else if setupB_entry
+        strategy.entry("Setup B", strategy.long)
+        tradeType := "B"
+        setupB_stop := structuralLow - pipBuffer
+
+// Exit Logic
+if strategy.position_size > 0
+    if tradeType == "A"
+        // Momentum trade: exit on weekly close below 20 SMA
+        if close < basis
+            strategy.close("Setup A", comment="SMA Stop")
+    else if tradeType == "B"
+        // Mean-reversion trade: hard stop below structural low
+        if low <= setupB_stop
+            strategy.close("Setup B", comment="Structural Low Stop")
+
+// ══════════════════════════════════════════════════════════════════════════════
+// VISUAL SIGNALS
+// ══════════════════════════════════════════════════════════════════════════════
+plotshape(setupA_entry and strategy.position_size[1] == 0, "Setup A Entry", shape.triangleup, location.belowbar, color.green, size=size.normal)
+plotshape(setupB_entry and strategy.position_size[1] == 0, "Setup B Entry", shape.triangleup, location.belowbar, color.teal, size=size.normal)
+
+// Plot structural low stop level when in a Setup B trade
+plot(strategy.position_size > 0 and tradeType == "B" ? setupB_stop : na, "Setup B Stop", color=color.red, style=plot.style_linebr, linewidth=2)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ALERTS
+// ══════════════════════════════════════════════════════════════════════════════
+alertcondition(setupA_entry, "Setup A: Momentum Breakout", "XAUUSD Weekly: Close above upper BB (+1 SD) — Momentum Breakout entry signal")
+alertcondition(setupB_entry, "Setup B: Mean-Reversion Pivot", "XAUUSD Weekly: Close back inside lower BB after breach — Mean-Reversion Pivot entry signal")
