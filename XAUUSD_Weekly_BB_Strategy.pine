@@ -35,7 +35,7 @@ pipBuffer = input.float(0.02, "Stop Buffer Below Structural Low ($)", minval=0.0
      tooltip="Buffer below the lowest wick during lower band breach (1-2 pips for XAUUSD ≈ $0.01-$0.02)")
 
 // --- Take Profit ---
-Extension_Percent = input.float(5.0, "Extreme Extension % Above Upper Band", minval=0.1, step=0.5,
+Extension_Percent = input.float(15.0, "Extreme Extension % Above Upper Band", minval=0.1, step=0.5,
      tooltip="If close is more than this % above the Upper BB, exit 50% of the position")
 
 // ══════════════════════════════════════════════════════════════════════════════
