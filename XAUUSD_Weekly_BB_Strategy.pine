@@ -2,112 +2,259 @@
 // https://mozilla.org/MPL/2.0/
 
 //@version=5
-strategy("Hyper-Responsive Weekly XAUUSD System", 
+strategy("Hyper-Responsive Weekly XAUUSD Portfolio System", 
      overlay=true, 
-     default_qty_type=strategy.percent_of_equity, 
-     default_qty_value=100, 
-     initial_capital=10000, 
+     default_qty_type=strategy.fixed, 
+     default_qty_value=0, 
+     initial_capital=0, 
      commission_type=strategy.commission.cash_per_order, 
      commission_value=0, 
      slippage=0,
-     calc_on_every_tick=false)
+     calc_on_every_tick=false,
+     process_orders_on_close=false,
+     currency=currency.USD)
 
 // ══════════════════════════════════════════════════════════════════════════════
 // INPUTS
 // ══════════════════════════════════════════════════════════════════════════════
-bbLength   = input.int(20, "BB Length", minval=1)
-bbMult     = input.float(1.0, "BB Std Dev Multiplier", minval=0.1, step=0.1)
-pipBuffer  = input.float(0.02, "Stop Buffer Below Structural Low (dollars)", minval=0.0, step=0.01, tooltip="Buffer below the lowest wick during lower band breach phase (equivalent to ~2 pips for XAUUSD)")
+
+// --- Capital & Sizing ---
+Weekly_Contribution = input.float(200.0, "Weekly Contribution ($)", minval=0, step=50, 
+     tooltip="Dollar amount added to cash pool at the open of each new weekly candle")
+
+// --- Bollinger Band Settings ---
+bbLength = input.int(20, "BB Length", minval=1)
+bbMult   = input.float(1.0, "BB Std Dev Multiplier", minval=0.1, step=0.1)
+
+// --- Setup Toggles ---
+enableSetupA = input.bool(true, "Enable Setup A (Momentum Breakout)")
+enableSetupB = input.bool(true, "Enable Setup B (Mean-Reversion Pivot)")
+
+// --- Risk Management ---
+pipBuffer = input.float(0.02, "Stop Buffer Below Structural Low ($)", minval=0.0, step=0.01, 
+     tooltip="Buffer below the lowest wick during lower band breach (1-2 pips for XAUUSD ≈ $0.01-$0.02)")
+
+// --- Take Profit ---
+Extension_Percent = input.float(5.0, "Extreme Extension % Above Upper Band", minval=0.1, step=0.5,
+     tooltip="If close is more than this % above the Upper BB, exit 50% of the position")
 
 // ══════════════════════════════════════════════════════════════════════════════
 // BOLLINGER BAND CALCULATIONS
 // ══════════════════════════════════════════════════════════════════════════════
-basis      = ta.sma(close, bbLength)
-dev        = bbMult * ta.stdev(close, bbLength)
-upperBand  = basis + dev
-lowerBand  = basis - dev
+basis     = ta.sma(close, bbLength)
+dev       = bbMult * ta.stdev(close, bbLength)
+upperBand = basis + dev
+lowerBand = basis - dev
+
+// ══════════════════════════════════════════════════════════════════════════════
+// WEEKLY CAPITAL ACCUMULATION LOGIC
+// ══════════════════════════════════════════════════════════════════════════════
+var float cash_pool = 0.0
+
+// Detect new weekly bar (first bar or change in bar_index)
+isNewBar = barstate.isconfirmed ? false : true  // not needed; use bar change
+// On each new bar (weekly candle open), add contribution
+// In Pine, each bar on 1W = one week. Strategy runs once per bar at close.
+// We add the weekly contribution at the start of each bar's processing.
+var int lastBarIndex = -1
+isNewWeeklyBar = bar_index != lastBarIndex
+if isNewWeeklyBar
+    cash_pool += Weekly_Contribution
+    lastBarIndex := bar_index
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SETUP B: MEAN-REVERSION PIVOT — BREACH TRACKING
+// ══════════════════════════════════════════════════════════════════════════════
+var bool  inBreachPhase = false
+var float structuralLow = na
+
+// A breach occurs when the weekly candle closes below the lower band
+breachBelow = close < lowerBand
+
+if breachBelow and not inBreachPhase
+    inBreachPhase := true
+    structuralLow := low
+else if breachBelow and inBreachPhase
+    structuralLow := math.min(structuralLow, low)
+else if not breachBelow and inBreachPhase and close < lowerBand == false
+    // Still in breach if close was below; update low tracking for wicks
+    noop = 0  // placeholder
+
+// Setup B signal: previous bar closed below lower band, current bar closes back inside/above
+setupB_signal = inBreachPhase and close >= lowerBand
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SETUP A: MOMENTUM BREAKOUT
+// ══════════════════════════════════════════════════════════════════════════════
+// Weekly candle closes above the upper band
+setupA_signal = close > upperBand
+
+// ══════════════════════════════════════════════════════════════════════════════
+// POSITION & TRADE STATE MANAGEMENT
+// ══════════════════════════════════════════════════════════════════════════════
+var string activeSetup       = ""       // "A" or "B"
+var float  entryPrice        = na
+var float  setupB_stopLevel  = na
+var float  positionQty       = 0.0      // Units (oz) held
+var float  capitalInTrade    = 0.0      // Dollar value deployed
+var bool   halfExited        = false    // Track if 50% extreme extension exit occurred
+var float  trailingStop3wk   = na       // 3-candle low trailing stop
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ENTRY LOGIC — Execute on bar close, fills at next bar open
+// Only enter when flat (no active position)
+// ══════════════════════════════════════════════════════════════════════════════
+var bool fireEntryA = false
+var bool fireEntryB = false
+
+// Determine if we are flat
+isFlat = strategy.position_size == 0
+
+if isFlat and cash_pool > 0
+    if enableSetupA and setupA_signal
+        fireEntryA := true
+    else if enableSetupB and setupB_signal
+        fireEntryB := true
+
+// Calculate quantity based on cash_pool and current close price
+// Qty = cash_pool / close (approximate; entry fills at next open, but we size on close)
+if fireEntryA
+    qty = cash_pool / close
+    if qty > 0
+        strategy.entry("Setup A", strategy.long, qty=qty)
+        activeSetup    := "A"
+        entryPrice     := close
+        capitalInTrade := cash_pool
+        positionQty    := qty
+        halfExited     := false
+        cash_pool      := 0.0
+    fireEntryA := false
+
+else if fireEntryB
+    qty = cash_pool / close
+    if qty > 0
+        strategy.entry("Setup B", strategy.long, qty=qty)
+        activeSetup     := "B"
+        entryPrice      := close
+        capitalInTrade  := cash_pool
+        positionQty     := qty
+        halfExited      := false
+        setupB_stopLevel := structuralLow - pipBuffer
+        cash_pool       := 0.0
+    // Reset breach phase after entry
+    inBreachPhase := false
+    fireEntryB    := false
+
+// ══════════════════════════════════════════════════════════════════════════════
+// EXIT LOGIC
+// ══════════════════════════════════════════════════════════════════════════════
+
+// --- 3-Candle Trailing Low (for Setup A take-profit) ---
+trailing3Low = ta.lowest(low, 3)
+
+// --- Extreme Extension Check ---
+extensionThreshold = upperBand * (1.0 + Extension_Percent / 100.0)
+extremeExtension   = close > extensionThreshold
+
+if strategy.position_size > 0
+
+    // ─── SETUP A EXITS ───
+    if activeSetup == "A"
+
+        // 1) STOP LOSS: Weekly close below 20 SMA → exit all at next open
+        if close < basis
+            strategy.close("Setup A", comment="SMA Stop Loss")
+            // Refund capital back to cash pool (stop loss recycling)
+            cash_pool      += capitalInTrade
+            capitalInTrade := 0.0
+            positionQty    := 0.0
+            activeSetup    := ""
+
+        // 2) EXTREME EXTENSION TAKE-PROFIT: Close > Extension% above upper band → exit 50%
+        else if extremeExtension and not halfExited
+            halfQty = strategy.position_size / 2.0
+            strategy.close("Setup A", comment="Extreme Extension 50% TP", qty=halfQty)
+            halfExited     := true
+            capitalInTrade := capitalInTrade / 2.0  // Remaining capital at risk
+            positionQty    := positionQty / 2.0
+
+        // 3) TRAILING TAKE-PROFIT (3-Candle Low): Close below 3-week lowest low
+        else if close < trailing3Low[1]  // Compare to the *completed* 3-candle low (prior bar's value)
+            strategy.close("Setup A", comment="3-Candle Trailing Stop")
+            capitalInTrade := 0.0
+            positionQty    := 0.0
+            activeSetup    := ""
+
+    // ─── SETUP B EXITS ───
+    else if activeSetup == "B"
+
+        // HARD INTRADAY STOP: Price wick touches/breaks below structural low stop
+        if low <= setupB_stopLevel
+            strategy.close("Setup B", comment="Structural Low Stop")
+            // Refund capital back to cash pool (stop loss recycling)
+            cash_pool      += capitalInTrade
+            capitalInTrade := 0.0
+            positionQty    := 0.0
+            activeSetup    := ""
 
 // ══════════════════════════════════════════════════════════════════════════════
 // PLOT BOLLINGER BANDS
 // ══════════════════════════════════════════════════════════════════════════════
-plot(basis, "SMA 20", color=color.orange, linewidth=2)
-p1 = plot(upperBand, "Upper Band (+1 SD)", color=color.blue)
-p2 = plot(lowerBand, "Lower Band (-1 SD)", color=color.blue)
-fill(p1, p2, color=color.new(color.blue, 90), title="BB Fill")
+plot(basis, "SMA 20 (Basis)", color=color.orange, linewidth=2)
+pUpper = plot(upperBand, "Upper Band (+1 SD)", color=color.blue, linewidth=1)
+pLower = plot(lowerBand, "Lower Band (-1 SD)", color=color.blue, linewidth=1)
+fill(pUpper, pLower, color=color.new(color.blue, 92), title="BB Fill")
 
 // ══════════════════════════════════════════════════════════════════════════════
-// SETUP A: MOMENTUM BREAKOUT
-// Weekly candle closes above the upper band → Long entry
-// Stop: Weekly close below the 20 SMA (center line)
+// PLOT TRAILING TAKE-PROFIT LINE (3-Candle Low)
 // ══════════════════════════════════════════════════════════════════════════════
-setupA_entry = close > upperBand
-
-// ══════════════════════════════════════════════════════════════════════════════
-// SETUP B: MEAN-REVERSION PIVOT
-// Track when price breaches below the lower band, record the structural low,
-// then enter when price closes back inside/above the lower band.
-// Stop: 1-2 pips below the absolute lowest wick during the breach phase.
-// ══════════════════════════════════════════════════════════════════════════════
-var bool   inBreachPhase    = false
-var float  structuralLow    = na
-
-// Detect breach below lower band (close below lower band)
-breachBelow = close < lowerBand
-
-// Update breach tracking
-if breachBelow and not inBreachPhase
-    // Starting a new breach phase
-    inBreachPhase := true
-    structuralLow := low
-else if breachBelow and inBreachPhase
-    // Continue tracking the lowest point during breach
-    structuralLow := math.min(structuralLow, low)
-
-// Setup B triggers when price closes back inside/above the lower band after a breach
-setupB_entry = inBreachPhase and close >= lowerBand
-
-// Reset breach phase on Setup B entry
-if setupB_entry
-    inBreachPhase := false
+trailingTPvisible = strategy.position_size > 0 and activeSetup == "A"
+plot(trailingTPvisible ? trailing3Low : na, "Trailing TP (3-Wk Low)", 
+     color=color.new(color.fuchsia, 0), style=plot.style_stepline, linewidth=2)
 
 // ══════════════════════════════════════════════════════════════════════════════
-// TRADE MANAGEMENT
+// PLOT SETUP B STOP LEVEL
 // ══════════════════════════════════════════════════════════════════════════════
-var string tradeType = ""  // "A" or "B"
-var float  setupB_stop = na
-
-// Entry Logic - only enter if flat
-if strategy.position_size == 0
-    if setupA_entry
-        strategy.entry("Setup A", strategy.long)
-        tradeType := "A"
-    else if setupB_entry
-        strategy.entry("Setup B", strategy.long)
-        tradeType := "B"
-        setupB_stop := structuralLow - pipBuffer
-
-// Exit Logic
-if strategy.position_size > 0
-    if tradeType == "A"
-        // Momentum trade: exit on weekly close below 20 SMA
-        if close < basis
-            strategy.close("Setup A", comment="SMA Stop")
-    else if tradeType == "B"
-        // Mean-reversion trade: hard stop below structural low
-        if low <= setupB_stop
-            strategy.close("Setup B", comment="Structural Low Stop")
+setupBStopVisible = strategy.position_size > 0 and activeSetup == "B"
+plot(setupBStopVisible ? setupB_stopLevel : na, "Setup B Stop Level", 
+     color=color.red, style=plot.style_linebr, linewidth=2)
 
 // ══════════════════════════════════════════════════════════════════════════════
-// VISUAL SIGNALS
+// PLOT EXTREME EXTENSION THRESHOLD
 // ══════════════════════════════════════════════════════════════════════════════
-plotshape(setupA_entry and strategy.position_size[1] == 0, "Setup A Entry", shape.triangleup, location.belowbar, color.green, size=size.normal)
-plotshape(setupB_entry and strategy.position_size[1] == 0, "Setup B Entry", shape.triangleup, location.belowbar, color.teal, size=size.normal)
+plot(extensionThreshold, "Extreme Extension Level", color=color.new(color.purple, 60), 
+     style=plot.style_circles, linewidth=1)
 
-// Plot structural low stop level when in a Setup B trade
-plot(strategy.position_size > 0 and tradeType == "B" ? setupB_stop : na, "Setup B Stop", color=color.red, style=plot.style_linebr, linewidth=2)
+// ══════════════════════════════════════════════════════════════════════════════
+// VISUAL ENTRY SIGNALS
+// ══════════════════════════════════════════════════════════════════════════════
+plotshape(enableSetupA and setupA_signal and isFlat and cash_pool[1] > 0, 
+     "Setup A Signal", shape.triangleup, location.belowbar, color.green, size=size.normal)
+plotshape(enableSetupB and setupB_signal and isFlat and cash_pool[1] > 0, 
+     "Setup B Signal", shape.triangleup, location.belowbar, color.teal, size=size.normal)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// INFO TABLE — Cash Pool Display
+// ══════════════════════════════════════════════════════════════════════════════
+var table infoPanel = table.new(position.top_right, 2, 4, bgcolor=color.new(color.black, 80), 
+     border_width=1, border_color=color.gray)
+
+if barstate.islast
+    table.cell(infoPanel, 0, 0, "Cash Pool", text_color=color.white, text_size=size.small)
+    table.cell(infoPanel, 1, 0, "$" + str.tostring(cash_pool, "#.##"), text_color=color.lime, text_size=size.small)
+    table.cell(infoPanel, 0, 1, "Capital In Trade", text_color=color.white, text_size=size.small)
+    table.cell(infoPanel, 1, 1, "$" + str.tostring(capitalInTrade, "#.##"), text_color=color.yellow, text_size=size.small)
+    table.cell(infoPanel, 0, 2, "Active Setup", text_color=color.white, text_size=size.small)
+    table.cell(infoPanel, 1, 2, activeSetup == "" ? "None" : activeSetup, text_color=color.aqua, text_size=size.small)
+    table.cell(infoPanel, 0, 3, "Position Qty", text_color=color.white, text_size=size.small)
+    table.cell(infoPanel, 1, 3, str.tostring(strategy.position_size, "#.#####"), text_color=color.white, text_size=size.small)
 
 // ══════════════════════════════════════════════════════════════════════════════
 // ALERTS
 // ══════════════════════════════════════════════════════════════════════════════
-alertcondition(setupA_entry, "Setup A: Momentum Breakout", "XAUUSD Weekly: Close above upper BB (+1 SD) — Momentum Breakout entry signal")
-alertcondition(setupB_entry, "Setup B: Mean-Reversion Pivot", "XAUUSD Weekly: Close back inside lower BB after breach — Mean-Reversion Pivot entry signal")
+alertcondition(enableSetupA and setupA_signal, "Setup A: Momentum Breakout", 
+     "XAUUSD Weekly: Close above upper BB (+1 SD) — Momentum Breakout entry signal")
+alertcondition(enableSetupB and setupB_signal, "Setup B: Mean-Reversion Pivot", 
+     "XAUUSD Weekly: Close back inside lower BB after breach — Mean-Reversion entry signal")
+alertcondition(extremeExtension and strategy.position_size > 0, "Extreme Extension Alert",
+     "XAUUSD Weekly: Price closed > Extension% above Upper BB — Consider partial profit-taking")
