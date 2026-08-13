@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import io
 import os
+import traceback
 from datetime import date, datetime
 from typing import List
 
@@ -99,19 +100,40 @@ def fetch_price_data(ticker: str, start: str, end: str) -> pd.DataFrame:
 
     t = yf.Ticker(ticker)
     df = t.history(start=start, end=end, auto_adjust=True)
-    if df.empty:
+
+    if df is None or df.empty:
         raise HTTPException(status_code=404, detail=f"No price data found for {ticker}")
 
+    # Handle MultiIndex columns (yfinance >= 0.2.40 returns ("Close", "TQQQ"))
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+
+    # Keep only the Close column
+    if "Close" not in df.columns:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Yahoo Finance returned unexpected columns: {list(df.columns)}"
+        )
+
     df = df[["Close"]].copy()
-    df.index = pd.to_datetime(df.index).tz_localize(None)
+
+    # Ensure timezone-naive datetime index
+    if df.index.tz is not None:
+        df.index = df.index.tz_localize(None)
+    df.index = pd.to_datetime(df.index)
     df.index.name = "Date"
+
     cache.set(cache_key, df.to_json(orient="split"), expire=CACHE_TTL)
     return df
 
 
 def resample_to_frequency(df: pd.DataFrame, frequency: str) -> pd.DataFrame:
     """Resample daily prices to the user-selected execution frequency."""
-    freq_map = {"weekly": "W-FRI", "monthly": "ME", "daily": None}
+    # Use "ME" for pandas >= 2.2, fall back to "M" for older versions
+    pandas_version = tuple(int(x) for x in pd.__version__.split(".")[:2])
+    month_freq = "ME" if pandas_version >= (2, 2) else "M"
+
+    freq_map = {"weekly": "W-FRI", "monthly": month_freq, "daily": None}
     freq = freq_map.get(frequency.lower())
     if freq is None:
         return df
@@ -131,6 +153,12 @@ def run_backtest(req: BacktestRequest) -> dict:
     raw_df["EMA"] = raw_df["Close"].ewm(span=req.ma_period, adjust=False).mean()
     df = resample_to_frequency(raw_df, req.execution_frequency)
     df = df.dropna(subset=["EMA"])
+
+    if df.empty:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No data available for {req.ticker} in the selected date range ({req.start_date} to {end_date})"
+        )
 
     # Yield per period
     n_periods_per_year = {"weekly": 52, "monthly": 12, "daily": 252}
@@ -349,13 +377,34 @@ def health():
 @app.post("/backtest")
 def backtest(req: BacktestRequest):
     """Run backtest and return JSON results with metrics."""
-    return run_backtest(req)
+    try:
+        return run_backtest(req)
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[ERROR] Backtest failed: {e}")
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Backtest engine error: {str(e)}"
+        )
 
 
 @app.post("/export-csv")
 def export_csv(req: BacktestRequest):
     """Run backtest and return the full audit trail as a downloadable CSV."""
-    result = run_backtest(req)
+    try:
+        result = run_backtest(req)
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[ERROR] Export failed: {e}")
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Export engine error: {str(e)}"
+        )
+
     rows = result["rows"]
     if not rows:
         raise HTTPException(status_code=400, detail="No data to export")
