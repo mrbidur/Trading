@@ -19,4 +19,5 @@ services:
       - backend
     environment:
       - NODE_ENV=production
+      - BACKEND_URL=http://backend:8000
     restart: unless-stopped

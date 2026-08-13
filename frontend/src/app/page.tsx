@@ -24,13 +24,18 @@ export default function HomePage() {
         body: JSON.stringify(config),
       });
       if (!res.ok) {
-        const err = await res.json().catch(() => ({ detail: "Unknown error" }));
-        throw new Error(err.detail || `HTTP ${res.status}`);
+        const err = await res.json().catch(() => null);
+        const detail = err?.detail || `Server returned HTTP ${res.status}. Make sure the backend is running on port 8000.`;
+        throw new Error(detail);
       }
       const data: BacktestResult = await res.json();
       setResult(data);
     } catch (e: any) {
-      setError(e.message || "Failed to run backtest");
+      if (e.message?.includes("fetch")) {
+        setError("Cannot connect to backend server. Make sure the backend is running (port 8000).");
+      } else {
+        setError(e.message || "Failed to run backtest");
+      }
     } finally {
       setLoading(false);
     }
