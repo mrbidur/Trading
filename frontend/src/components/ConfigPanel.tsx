@@ -138,21 +138,21 @@ export default function ConfigPanel({ config, onChange, onRun, loading }: Config
       {/* SCAN FREQUENCY (decoupled from deposits) */}
       <div className="flex flex-col gap-1">
         <label className="text-xs text-muted-foreground font-medium">
-          Price Scan Frequency
+          Execution Frequency
         </label>
         <select
           value={config.execution_frequency}
           onChange={(e) => update({ execution_frequency: e.target.value })}
           className="bg-secondary/50 border border-border rounded-md px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
         >
-          <option value="daily">Daily Close (exits evaluated daily)</option>
-          <option value="intraday">Intraday Hourly (exits evaluated every hour)</option>
+          <option value="weekly">Weekly (Friday Close)</option>
+          <option value="daily">Daily Close</option>
+          <option value="intraday">Intraday Hourly</option>
         </select>
       </div>
       <InfoBanner>
-        <strong>Decoupled model:</strong> Deposits are always weekly (Friday).
-        Profit harvests &amp; tranche buys trigger continuously based on scan frequency.
-        Cash yield compounds weekly at APY/52.
+        <strong>Weekly mode (recommended):</strong> All logic — deposits, profit harvests,
+        tranche buys — evaluated exclusively on Friday close. Matches research PDF methodology.
       </InfoBanner>
 
       {/* ====== WEEKLY CONTRIBUTIONS ====== */}
