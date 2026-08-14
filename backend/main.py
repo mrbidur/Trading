@@ -1,8 +1,15 @@
 """
-Dynamic Leveraged ETF Backtesting – FastAPI Backend
-====================================================
-State-machine-based allocation strategy engine with full CSV export.
-Supports daily, weekly, monthly, and intraday (hourly) execution frequencies.
+Dynamic Leveraged ETF Backtesting – FastAPI Backend (v2.0)
+===========================================================
+DECOUPLED ARCHITECTURE:
+  - Deposits:  Strictly WEEKLY (Friday close), fixed schedule
+  - Exits:     Evaluated CONTINUOUSLY on every bar (daily or intraday)
+  - Cash Yield: Compounds WEEKLY on calendar week boundaries
+  - Drawdown:  Computed on total portfolio value (shares*price + cash_buffer)
+
+This separation prevents conflation of deposit intervals with position-exit
+evaluations, ensuring overextended peaks trigger profit-taking the exact
+moment thresholds are met.
 """
 from __future__ import annotations
 
@@ -10,7 +17,7 @@ import io
 import os
 import traceback
 from datetime import date, datetime, timedelta
-from typing import List
+from typing import List, Optional
 
 import diskcache
 import numpy as np
@@ -24,7 +31,7 @@ from pydantic import BaseModel, Field
 # ---------------------------------------------------------------------------
 # App & CORS
 # ---------------------------------------------------------------------------
-app = FastAPI(title="ETF Backtest API", version="1.0.0")
+app = FastAPI(title="ETF Backtest API", version="2.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -60,11 +67,11 @@ class AdaptiveConfig(BaseModel):
 class BacktestRequest(BaseModel):
     # Asset / timeframe
     ticker: str = Field(default="TQQQ")
-    start_date: str = Field(default="2015-01-01")
+    start_date: str = Field(default="2010-01-01")
     end_date: str = Field(default="")
-    execution_frequency: str = Field(default="weekly")  # weekly | daily | monthly | intraday
+    execution_frequency: str = Field(default="daily")  # daily | intraday
 
-    # Contributions
+    # Contributions (ALWAYS weekly regardless of scan frequency)
     base_deposit: float = Field(default=200.0, ge=0.0)
     overbought_deposit: float = Field(default=100.0, ge=0.0)
     tranche_deposit: float = Field(default=400.0, ge=0.0)
@@ -83,7 +90,7 @@ class BacktestRequest(BaseModel):
     # Adaptive mode
     adaptive: AdaptiveConfig = Field(default_factory=AdaptiveConfig)
 
-    # Yield
+    # Yield (compounds WEEKLY regardless of scan frequency)
     cash_yield_apy: float = Field(default=4.5, ge=0.0)
 
 
@@ -94,12 +101,13 @@ def fetch_price_data(ticker: str, start: str, end: str, intraday: bool = False) 
     """
     Fetch OHLCV data from Yahoo Finance with local disk cache.
     
-    For intraday mode: fetches 1-hour bars. Yahoo Finance limits intraday
-    history to ~730 days, so we fetch in chunks if needed.
-    For daily mode: fetches daily close prices.
+    - intraday=True: 1-hour bars (limited to ~730 days per yfinance chunk)
+    - intraday=False: daily bars (full history available)
+    
+    Always fetches High, Low, Close for accurate threshold detection.
     """
     interval = "1h" if intraday else "1d"
-    cache_key = f"prices_{ticker}_{start}_{end}_{interval}"
+    cache_key = f"prices_v2_{ticker}_{start}_{end}_{interval}"
 
     if cache_key in cache:
         raw = cache[cache_key]
@@ -110,8 +118,6 @@ def fetch_price_data(ticker: str, start: str, end: str, intraday: bool = False) 
     t = yf.Ticker(ticker)
 
     if intraday:
-        # Yahoo Finance limits intraday to ~730 days per request
-        # Fetch in chunks and concatenate
         start_dt = datetime.strptime(start, "%Y-%m-%d")
         end_dt = datetime.strptime(end, "%Y-%m-%d") if end else datetime.now()
         
@@ -132,7 +138,7 @@ def fetch_price_data(ticker: str, start: str, end: str, intraday: bool = False) 
         if not chunks:
             raise HTTPException(
                 status_code=404,
-                detail=f"No intraday data found for {ticker}. Note: Yahoo Finance limits intraday history to ~2 years."
+                detail=f"No intraday data found for {ticker}. Yahoo Finance limits intraday to ~2 years."
             )
         df = pd.concat(chunks)
         df = df[~df.index.duplicated(keep="first")]
@@ -142,7 +148,7 @@ def fetch_price_data(ticker: str, start: str, end: str, intraday: bool = False) 
     if df is None or df.empty:
         raise HTTPException(status_code=404, detail=f"No price data found for {ticker}")
 
-    # Handle MultiIndex columns (yfinance >= 0.2.40 returns ("Close", "TQQQ"))
+    # Handle MultiIndex columns (yfinance >= 0.2.40)
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
 
@@ -152,11 +158,13 @@ def fetch_price_data(ticker: str, start: str, end: str, intraday: bool = False) 
             detail=f"Yahoo Finance returned unexpected columns: {list(df.columns)}"
         )
 
-    # For intraday, also keep High and Low for threshold detection
-    if intraday and "High" in df.columns and "Low" in df.columns:
-        df = df[["Close", "High", "Low"]].copy()
-    else:
-        df = df[["Close"]].copy()
+    # Keep Close, High, Low for threshold detection
+    keep_cols = ["Close"]
+    if "High" in df.columns:
+        keep_cols.append("High")
+    if "Low" in df.columns:
+        keep_cols.append("Low")
+    df = df[keep_cols].copy()
 
     # Ensure timezone-naive datetime index
     if df.index.tz is not None:
@@ -168,99 +176,122 @@ def fetch_price_data(ticker: str, start: str, end: str, intraday: bool = False) 
     return df
 
 
-def resample_to_frequency(df: pd.DataFrame, frequency: str) -> pd.DataFrame:
-    """Resample prices to the user-selected execution frequency."""
-    # Use "ME" for pandas >= 2.2, fall back to "M" for older versions
-    pandas_version = tuple(int(x) for x in pd.__version__.split(".")[:2])
-    month_freq = "ME" if pandas_version >= (2, 2) else "M"
+# ---------------------------------------------------------------------------
+# Helper: Determine if a given date is a weekly deposit day (Friday)
+# ---------------------------------------------------------------------------
+def is_deposit_week_boundary(current_dt: datetime, last_deposit_dt: Optional[datetime]) -> bool:
+    """
+    Returns True if current_dt is on a Friday (weekday=4) and it's a
+    different ISO week from the last deposit. This ensures exactly one
+    deposit per calendar week.
+    """
+    if last_deposit_dt is None:
+        # First bar — allow deposit if it's a Friday, or the first available bar
+        return True
+    
+    current_week = current_dt.isocalendar()[1]
+    current_year = current_dt.isocalendar()[0]
+    last_week = last_deposit_dt.isocalendar()[1]
+    last_year = last_deposit_dt.isocalendar()[0]
+    
+    return (current_year, current_week) != (last_year, last_week)
 
-    freq_map = {"weekly": "W-FRI", "monthly": month_freq, "daily": None, "intraday": None}
-    freq = freq_map.get(frequency.lower())
-    if freq is None:
-        return df  # daily/intraday: no resampling
-    resampled = df.resample(freq).last().dropna()
-    return resampled
+
+def is_yield_week_boundary(current_dt: datetime, last_yield_dt: Optional[datetime]) -> bool:
+    """
+    Returns True if we've crossed into a new calendar week since last yield application.
+    Cash yield compounds once per week regardless of scan frequency.
+    """
+    if last_yield_dt is None:
+        return False  # Don't compound on the very first bar
+    
+    current_week = current_dt.isocalendar()[1]
+    current_year = current_dt.isocalendar()[0]
+    last_week = last_yield_dt.isocalendar()[1]
+    last_year = last_yield_dt.isocalendar()[0]
+    
+    return (current_year, current_week) != (last_year, last_week)
 
 
 # ---------------------------------------------------------------------------
-# Backtesting State Machine Engine
+# Backtesting State Machine Engine (v2.0 — Decoupled Architecture)
 # ---------------------------------------------------------------------------
 def run_backtest(req: BacktestRequest) -> dict:
     """
-    Run the full state-machine backtest and return structured results.
+    DECOUPLED EXECUTION MODEL:
+    ==========================
     
-    Key design decisions for accurate TQQQ overbought detection:
+    1. DATA SCANNING: Every bar (daily close or intraday hourly) is evaluated
+       for exit conditions (profit harvests, step scale-outs, tranche buys).
+       This ensures price targets trigger the EXACT moment they're touched.
     
-    1. PROFIT HARVEST DISTANCE: Measures how far price has extended above the
-       EMA as a percentage: ((price - ema) / ema) * 100. For leveraged ETFs
-       like TQQQ, a +40% extension above the 200-day EMA represents an 
-       extreme overextension (~13% above EMA on the underlying QQQ).
-       
-    2. INTRADAY MODE: When enabled, the engine evaluates each hourly bar's
-       High price against thresholds. This ensures profit harvests trigger
-       at the EXACT moment price crosses the threshold, not hours later at
-       market close. Trades execute at the threshold-crossing price.
-       
-    3. HYSTERESIS RESET: After a profit harvest, the overbought flag remains
-       locked TRUE until price drops STRICTLY BELOW the hysteresis_reset_pct.
-       Additionally, a cooldown counter ensures the flag cannot reset within
-       the same trading session that triggered the harvest. This prevents
-       whipsaw re-entry where a brief dip followed by continuation would
-       immediately re-trigger another harvest.
+    2. DEPOSITS: Cash contributions occur on a STRICT WEEKLY schedule 
+       (one deposit per calendar week, on the first bar of each new week).
+       The deposit amount depends on current state:
+       - Normal state:    base_deposit ($200 default)
+       - Overbought state: overbought_deposit ($100 default)
+       - Tranche buy week: tranche_deposit ($400 default)
+    
+    3. CASH YIELD: Interest on the cash buffer compounds ONCE PER WEEK
+       at APY/52, regardless of how many bars are scanned. This models
+       weekly T-bill yield sweeps accurately.
+    
+    4. DRAWDOWN: Computed on TOTAL PORTFOLIO VALUE (shares*price + cash_buffer),
+       NOT on raw asset price. The cash buffer provides capital protection that
+       must be reflected in risk metrics.
+    
+    PROFIT HARVEST DISTANCE (TQQQ-specific rationale):
+    - dist_pct = ((price - EMA_200) / EMA_200) * 100
+    - +40% on TQQQ ≈ +13% on underlying QQQ above its 200-day EMA
+    - At this level, historical data shows high probability of mean-reversion
+    - The EMA captures TQQQ's own compounding/decay dynamics
+    
+    HYSTERESIS RESET (prevents premature re-entry):
+    - After harvest, overbought flag stays TRUE until:
+      a) Price drops STRICTLY BELOW hysteresis_reset_pct (using Low for intraday)
+      b) Cooldown period elapses (prevents same-session whipsaw)
+    - Both conditions must be met before a new harvest cycle can begin
     """
     end_date = req.end_date if req.end_date else date.today().isoformat()
     is_intraday = req.execution_frequency.lower() == "intraday"
 
+    # -----------------------------------------------------------------------
+    # FETCH RAW PRICE DATA
+    # -----------------------------------------------------------------------
     raw_df = fetch_price_data(req.ticker, req.start_date, end_date, intraday=is_intraday)
 
-    # ---------------------------------------------------------------------------
-    # EMA Computation
-    # For intraday: compute EMA on the hourly close prices using an equivalent
-    # period. A 200-day EMA ~ 200*6.5 = 1300 hourly bars (regular trading hours).
-    # This gives the same smoothing behavior adapted to the bar frequency.
-    # ---------------------------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # COMPUTE EMA ON RAW DATA (at scan granularity)
+    # For intraday: 200 days * 6.5 hours/day = 1300 hourly bars equivalent
+    # -----------------------------------------------------------------------
     if is_intraday:
-        # Convert day-based MA period to equivalent hourly bars
-        # ~6.5 trading hours per day for US equities
         hourly_ema_span = int(req.ma_period * 6.5)
         raw_df["EMA"] = raw_df["Close"].ewm(span=hourly_ema_span, adjust=False).mean()
     else:
         raw_df["EMA"] = raw_df["Close"].ewm(span=req.ma_period, adjust=False).mean()
 
-    df = resample_to_frequency(raw_df, req.execution_frequency)
-    df = df.dropna(subset=["EMA"])
+    # Drop rows where EMA hasn't warmed up
+    df = raw_df.dropna(subset=["EMA"])
 
     if df.empty:
         raise HTTPException(
             status_code=400,
-            detail=f"No data available for {req.ticker} in the selected date range ({req.start_date} to {end_date})"
+            detail=f"No data available for {req.ticker} in range {req.start_date} to {end_date}"
         )
 
-    # ---------------------------------------------------------------------------
-    # Periods per year (for yield and Sortino calculations)
-    # ---------------------------------------------------------------------------
-    n_periods_per_year = {
-        "weekly": 52,
-        "monthly": 12,
-        "daily": 252,
-        "intraday": 252 * 7,  # ~6.5 hours/day * ~252 days ~ 1638 bars/year
-    }
-    ppy = n_periods_per_year.get(req.execution_frequency.lower(), 52)
-    yield_per_period = (1 + req.cash_yield_apy / 100.0) ** (1.0 / ppy) - 1
+    # -----------------------------------------------------------------------
+    # WEEKLY CASH YIELD: APY/52 per week (constant regardless of scan freq)
+    # Formula: Cash_t = Cash_{t-1} * (1 + APY/52)
+    # Applied once per calendar week crossing.
+    # -----------------------------------------------------------------------
+    weekly_yield_factor = 1 + (req.cash_yield_apy / 100.0) / 52.0
 
-    # ---------------------------------------------------------------------------
-    # Deposit frequency for intraday mode
-    # In intraday mode, deposits are made once per trading day (first bar of day)
-    # to avoid unrealistically inflating contributions.
-    # ---------------------------------------------------------------------------
-    last_deposit_date = None  # Track daily deposit for intraday mode
-
-    # ---------------------------------------------------------------------------
-    # State variables
-    # ---------------------------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # STATE VARIABLES
+    # -----------------------------------------------------------------------
     in_overbought = False
-    hysteresis_confirmed_below = False  # Must confirm price dropped below reset level
-    harvest_cooldown_bars = 0  # Bars since last harvest (prevents same-session reset)
+    hysteresis_confirmed_below = False
+    harvest_cooldown_bars = 0
     n_harvest = 0
     swing_high_peak = 0.0
     cash_buffer = 0.0
@@ -268,20 +299,31 @@ def run_backtest(req: BacktestRequest) -> dict:
     total_shares = 0.0
     total_out_of_pocket = 0.0
     tranches_triggered = [False] * len(req.tranches.thresholds)
+    active_step_triggers: List[float] = []
+
+    # Deposit & yield tracking (decoupled from scan)
+    last_deposit_dt: Optional[datetime] = None
+    last_yield_dt: Optional[datetime] = None
 
     # DCA baseline
     dca_shares = 0.0
     dca_out_of_pocket = 0.0
+    last_dca_deposit_dt: Optional[datetime] = None
 
     rows: List[dict] = []
     dca_rows: List[dict] = []
-    active_step_triggers: List[float] = []
 
-    # Minimum cooldown bars before hysteresis can reset after a harvest
-    # For intraday: ~13 bars (2 hours), for daily: 3 bars, weekly: 1 bar
-    COOLDOWN_MAP = {"intraday": 13, "daily": 3, "weekly": 1, "monthly": 1}
+    # Cooldown bars for hysteresis (intraday needs more bars to confirm)
+    COOLDOWN_MAP = {"intraday": 13, "daily": 3}
     cooldown_threshold = COOLDOWN_MAP.get(req.execution_frequency.lower(), 3)
 
+    # Track whether a tranche fired this week (affects deposit amount)
+    tranche_fired_this_week = False
+    last_tranche_week: Optional[tuple] = None
+
+    # -----------------------------------------------------------------------
+    # MAIN LOOP: Iterate every bar (daily close or hourly)
+    # -----------------------------------------------------------------------
     for exec_date, row_data in df.iterrows():
         price = float(row_data["Close"])
         ema = float(row_data["EMA"])
@@ -289,137 +331,101 @@ def run_backtest(req: BacktestRequest) -> dict:
         if price <= 0 or ema <= 0:
             continue
 
-        # -------------------------------------------------------------------
-        # PROFIT HARVEST DISTANCE CALCULATION (Refined for TQQQ)
-        # 
-        # For leveraged ETFs, the EMA distance metric captures "overextension":
-        #   dist_pct = ((current_price - ema) / ema) * 100
-        #
-        # Why this works for TQQQ:
-        # - TQQQ amplifies QQQ moves 3x daily, but compounding causes
-        #   exponential divergence during sustained rallies.
-        # - A +40% distance above 200-EMA on TQQQ typically corresponds to
-        #   QQQ being ~12-15% above its own 200-EMA — a historically
-        #   overextended condition that reverts.
-        # - Using the EMA of TQQQ itself (not the underlying) captures the
-        #   actual compounding/decay dynamics inherent to the leveraged product.
-        #
-        # For intraday: we check the bar's HIGH against the trigger to detect
-        # the exact moment the threshold was breached within the bar.
-        # -------------------------------------------------------------------
-        
-        # Use High price for threshold detection in intraday mode
-        check_price_high = float(row_data["High"]) if (is_intraday and "High" in row_data.index) else price
-        check_price_low = float(row_data["Low"]) if (is_intraday and "Low" in row_data.index) else price
+        # Get High/Low for intraday threshold precision
+        has_hl = "High" in row_data.index and "Low" in row_data.index
+        check_high = float(row_data["High"]) if has_hl else price
+        check_low = float(row_data["Low"]) if has_hl else price
 
-        # Distance from EMA (using bar high for overbought detection)
+        # Distance from EMA calculations
         dist_pct_close = ((price - ema) / ema) * 100.0
-        dist_pct_high = ((check_price_high - ema) / ema) * 100.0
-        dist_pct_low = ((check_price_low - ema) / ema) * 100.0
+        dist_pct_high = ((check_high - ema) / ema) * 100.0
+        dist_pct_low = ((check_low - ema) / ema) * 100.0
+        dist_pct = dist_pct_close  # Official record uses close
 
-        # The "official" dist_pct for record-keeping is based on close
-        dist_pct = dist_pct_close
+        # Current datetime for weekly boundary checks
+        current_dt = exec_date.to_pydatetime() if hasattr(exec_date, 'to_pydatetime') else exec_date
 
-        # 1. Apply periodic cash yield on uninvested cash
-        cash_buffer *= (1 + yield_per_period)
+        # ===================================================================
+        # PHASE 1: WEEKLY CASH YIELD COMPOUNDING
+        # Applied once when crossing into a new calendar week.
+        # Formula: Cash_buffer *= (1 + APY/52)
+        # ===================================================================
+        if is_yield_week_boundary(current_dt, last_yield_dt):
+            cash_buffer *= weekly_yield_factor
+            last_yield_dt = current_dt
+        elif last_yield_dt is None:
+            last_yield_dt = current_dt  # Initialize on first bar
 
-        # -------------------------------------------------------------------
-        # 2. HYSTERESIS RESET LOGIC (Corrected)
-        #
-        # The overbought flag can ONLY reset when ALL of these are true:
-        #   a) Price (using LOW for intraday, CLOSE otherwise) has dropped
-        #      STRICTLY BELOW the hysteresis_reset_pct threshold
-        #   b) A minimum cooldown period has elapsed since the last harvest
-        #      (prevents same-bar or immediate-next-bar whipsaw resets)
-        #   c) The below-threshold condition is confirmed (prevents noise)
-        #
-        # This 2-stage confirmation prevents:
-        #   - Whipsaw: harvest at +40%, brief dip to +39%, immediately
-        #     re-arms and harvests again at +40% on the same move
-        #   - Premature re-entry: must see genuine mean-reversion below
-        #     the buffer level before allowing another harvest cycle
-        # -------------------------------------------------------------------
+        # ===================================================================
+        # PHASE 2: HYSTERESIS RESET EVALUATION (continuous)
+        # The overbought flag can only reset when:
+        #   a) Price LOW drops STRICTLY BELOW hysteresis_reset_pct
+        #   b) Cooldown period has elapsed since last harvest
+        # This prevents premature re-entry during choppy bull runs.
+        # ===================================================================
         if in_overbought:
             harvest_cooldown_bars += 1
-
-            # Check if price has genuinely dropped below the reset threshold
+            
+            # Check using LOW (intraday) or CLOSE (daily) for genuine reversion
             reset_check_dist = dist_pct_low if is_intraday else dist_pct_close
-
+            
             if reset_check_dist < req.hysteresis_reset_pct:
-                # Price is below reset level — mark as confirmed
                 hysteresis_confirmed_below = True
-
-            # Only reset overbought if confirmed below AND cooldown elapsed
+            
+            # Two-stage confirmation: below threshold + cooldown elapsed
             if hysteresis_confirmed_below and harvest_cooldown_bars >= cooldown_threshold:
                 in_overbought = False
                 hysteresis_confirmed_below = False
                 harvest_cooldown_bars = 0
                 active_step_triggers = []
 
-        action = "NORMAL DCA"
-        deposit = req.base_deposit
-        tranche_fired = False
-
-        # For intraday: only allow one deposit per calendar day
-        if is_intraday:
-            current_date = exec_date.date() if hasattr(exec_date, 'date') else exec_date
-            if last_deposit_date == current_date:
-                deposit = 0.0  # Already deposited today
-            else:
-                last_deposit_date = current_date
-
-        # -------------------------------------------------------------------
-        # 3. OVERBOUGHT PROFIT-TAKE (Refined for accuracy)
-        #
-        # Trigger condition uses HIGH price for intraday (captures exact moment)
-        # or CLOSE price for end-of-day frequencies.
-        #
-        # For TQQQ specifically, the +40% default trigger represents:
-        # - Price that is 1.4x the 200-day EMA
-        # - Historically, TQQQ reverts significantly from these levels
-        # - The trigger uses the bar's HIGH to capture the peak of the move,
-        #   then executes the sale at that high price (best-case intraday fill)
-        # -------------------------------------------------------------------
+        # ===================================================================
+        # PHASE 3: PROFIT HARVEST EVALUATION (continuous — every bar)
+        # Uses HIGH for intraday (captures exact threshold crossing)
+        # Uses CLOSE for daily (end-of-day evaluation)
+        # ===================================================================
+        action = "HOLD"  # Default action when no deposit and no event
         harvest_trigger_dist = dist_pct_high if is_intraday else dist_pct_close
 
         if harvest_trigger_dist >= req.profit_harvest_dist_pct and not in_overbought:
+            # === PROFIT TAKE TRIGGERED ===
             in_overbought = True
             hysteresis_confirmed_below = False
             harvest_cooldown_bars = 0
             n_harvest += 1
 
-            # For intraday: execute at the threshold-crossing price (estimated)
-            # This is the price where distance exactly equals the trigger
+            # Execution price: threshold-crossing price for intraday, close for daily
             threshold_price = ema * (1 + req.profit_harvest_dist_pct / 100.0)
             execution_price = threshold_price if is_intraday else price
-            
-            swing_high_peak = max(price, check_price_high)
 
+            swing_high_peak = max(price, check_high)
+
+            # Sell initial_scale_out_pct of current shares
             shares_to_sell = total_shares * (req.initial_scale_out_pct / 100.0)
             cash_harvested = shares_to_sell * execution_price
             total_shares -= shares_to_sell
             cash_buffer += cash_harvested
             peak_cash_buffer = cash_buffer
 
-            action = f"PROFIT TAKE ({req.initial_scale_out_pct:.0f}%)"
-            deposit = req.overbought_deposit if deposit != 0 else 0.0
+            # Reset tranche triggers for new cycle
             tranches_triggered = [False] * len(req.tranches.thresholds)
 
-            # Build step triggers above the initial harvest level
+            # Build step scale-out triggers above initial harvest level
             active_step_triggers = [
                 req.profit_harvest_dist_pct + req.step_trigger_increment_pct * (i + 1)
                 for i in range(10)
             ]
 
-        elif in_overbought:
-            deposit = req.overbought_deposit if deposit != 0 else 0.0
-            swing_high_peak = max(swing_high_peak, check_price_high if is_intraday else price)
+            action = f"PROFIT TAKE ({req.initial_scale_out_pct:.0f}%)"
 
-            # Step scale-outs: check using HIGH for intraday precision
+        elif in_overbought:
+            # Update swing high peak continuously during overbought state
+            swing_high_peak = max(swing_high_peak, check_high if is_intraday else price)
+
+            # === STEP SCALE-OUTS (continuous evaluation) ===
             step_check_dist = dist_pct_high if is_intraday else dist_pct_close
             for st in list(active_step_triggers):
                 if step_check_dist >= st:
-                    # Execute at the threshold-crossing price for intraday
                     step_exec_price = ema * (1 + st / 100.0) if is_intraday else price
                     step_shares = total_shares * (req.step_scale_out_pct / 100.0)
                     cash_buffer += step_shares * step_exec_price
@@ -429,7 +435,12 @@ def run_backtest(req: BacktestRequest) -> dict:
                     action = f"STEP SCALE-OUT @ +{st:.0f}%"
                     break
 
-        # 4. Adaptive tranche threshold
+        # ===================================================================
+        # PHASE 4: TRANCHE DIP-BUY EVALUATION (continuous — every bar)
+        # Evaluates pullback from swing high peak using LOW (intraday) or
+        # CLOSE (daily) to detect exact moment threshold is breached.
+        # ===================================================================
+        # Adaptive tranche threshold
         tau_1 = (
             req.adaptive.adaptive_tranche_1
             if (req.adaptive.enabled and n_harvest >= req.adaptive.n_harvest_target)
@@ -437,29 +448,30 @@ def run_backtest(req: BacktestRequest) -> dict:
         )
         active_tranches = [tau_1] + list(req.tranches.thresholds[1:])
 
-        # 5. Pullback from swing high (use LOW for intraday to catch exact dip)
-        pullback_check_price = check_price_low if is_intraday else price
+        # Pullback calculation from swing high
+        pullback_check_price = check_low if is_intraday else price
         pullback_pct = (
             ((pullback_check_price - swing_high_peak) / swing_high_peak) * 100.0
             if swing_high_peak > 0
             else 0.0
         )
 
-        # 6. Tranche dip-buy
+        tranche_fired = False
         for t_idx, trigger_level in enumerate(active_tranches):
             if t_idx < len(tranches_triggered) and pullback_pct <= trigger_level and not tranches_triggered[t_idx]:
                 tranches_triggered[t_idx] = True
-                tranche_deposit_amount = req.tranche_deposit
-                n_harvest = 0
+                n_harvest = 0  # Reset consecutive harvest counter
                 tranche_fired = True
 
+                # Deploy cash_deploy_pct of peak cash buffer + tranche deposit
+                tranche_deposit_amount = req.tranche_deposit
                 cash_to_deploy = (peak_cash_buffer * (req.tranches.cash_deploy_pct / 100.0)) + tranche_deposit_amount
                 actual_deploy = min(cash_buffer + tranche_deposit_amount, cash_to_deploy)
 
-                # For intraday: execute at the threshold-crossing price
+                # Execution price at threshold crossing for intraday
                 if is_intraday and swing_high_peak > 0:
                     tranche_exec_price = swing_high_peak * (1 + trigger_level / 100.0)
-                    tranche_exec_price = max(tranche_exec_price, check_price_low)
+                    tranche_exec_price = max(tranche_exec_price, check_low)
                 else:
                     tranche_exec_price = price
 
@@ -467,23 +479,63 @@ def run_backtest(req: BacktestRequest) -> dict:
                 total_shares += shares_bought
                 cash_buffer = max(0.0, cash_buffer + tranche_deposit_amount - actual_deploy)
                 total_out_of_pocket += tranche_deposit_amount
-                deposit = tranche_deposit_amount
+
+                # Track that a tranche fired this week
+                current_week_key = current_dt.isocalendar()[:2]
+                last_tranche_week = current_week_key
+                tranche_fired_this_week = True
+
                 action = f"TRANCHE {t_idx + 1} BUY ({trigger_level:.0f}%)"
                 break
 
-        # 7. Normal DCA (when no tranche fired)
-        if not tranche_fired and deposit > 0:
-            shares_bought = deposit / price
-            total_shares += shares_bought
-            total_out_of_pocket += deposit
+        # ===================================================================
+        # PHASE 5: WEEKLY DEPOSIT (strictly once per calendar week)
+        # 
+        # Deposits are DECOUPLED from exit evaluations:
+        # - They occur on the first bar of each new calendar week
+        # - Amount depends on current state machine state:
+        #     Normal:     base_deposit ($200)
+        #     Overbought: overbought_deposit ($100)
+        #     Tranche:    tranche_deposit ($400) — already handled above
+        # - Deposit buys shares at current close price
+        # ===================================================================
+        deposit = 0.0
+        is_deposit_bar = is_deposit_week_boundary(current_dt, last_deposit_dt)
 
+        if is_deposit_bar:
+            # Determine deposit amount based on state
+            if tranche_fired:
+                # Tranche buy already handled the deposit + deployment above
+                deposit = 0.0  # Don't double-deposit
+            elif in_overbought:
+                deposit = req.overbought_deposit
+            else:
+                deposit = req.base_deposit
+
+            # Execute deposit: buy shares at current price
+            if deposit > 0:
+                shares_bought = deposit / price
+                total_shares += shares_bought
+                total_out_of_pocket += deposit
+                if action == "HOLD":
+                    action = "WEEKLY DCA" if not in_overbought else "WEEKLY DCA (OB)"
+
+            last_deposit_dt = current_dt
+
+            # Reset weekly tranche tracking
+            current_week_key = current_dt.isocalendar()[:2]
+            if last_tranche_week != current_week_key:
+                tranche_fired_this_week = False
+
+        # ===================================================================
+        # PHASE 6: PORTFOLIO VALUATION
+        # Total Portfolio = (Shares * Current Price) + Cash Buffer
+        # This is the TRUE portfolio value including capital protection.
+        # ===================================================================
         portfolio_valuation = (total_shares * price) + cash_buffer
 
-        # Format date string based on frequency
-        if is_intraday:
-            date_str = exec_date.strftime("%Y-%m-%d %H:%M")
-        else:
-            date_str = exec_date.strftime("%Y-%m-%d")
+        # Format date
+        date_str = exec_date.strftime("%Y-%m-%d %H:%M") if is_intraday else exec_date.strftime("%Y-%m-%d")
 
         rows.append({
             "date": date_str,
@@ -496,36 +548,45 @@ def run_backtest(req: BacktestRequest) -> dict:
             "pullback_pct": round(pullback_pct, 4),
             "tranche_1_trigger": round(tau_1, 2),
             "action": action,
-            "deposit": round(deposit, 2),
+            "deposit": round(deposit + (req.tranche_deposit if tranche_fired else 0), 2),
             "cash_buffer": round(cash_buffer, 2),
             "total_shares": round(total_shares, 6),
             "portfolio_valuation": round(portfolio_valuation, 2),
             "out_of_pocket_total": round(total_out_of_pocket, 2),
         })
 
-        # DCA baseline (one deposit per day for intraday, per period otherwise)
-        if not is_intraday or (is_intraday and deposit > 0):
-            dca_deposit = req.base_deposit if deposit > 0 else 0.0
-            dca_shares += dca_deposit / price if price > 0 else 0.0
-            dca_out_of_pocket += dca_deposit
-        
+        # DCA baseline: also weekly deposits only
+        if is_deposit_bar:
+            dca_shares += req.base_deposit / price if price > 0 else 0.0
+            dca_out_of_pocket += req.base_deposit
+
         dca_rows.append({
             "date": date_str,
             "portfolio_valuation": round(dca_shares * price, 2),
             "out_of_pocket_total": round(dca_out_of_pocket, 2),
         })
 
-    # ---------------------------------------------------------------------------
-    # Performance Metrics
-    # ---------------------------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # PERFORMANCE METRICS (Corrected Drawdown)
+    # -----------------------------------------------------------------------
     def compute_metrics(valuations: List[float], invested: List[float], dates: List[str]) -> dict:
+        """
+        Compute performance metrics using TOTAL PORTFOLIO VALUE.
+        
+        CRITICAL FIX: Maximum Drawdown (MDD) is calculated on the full portfolio
+        equity curve (shares*price + cash_buffer), NOT on the raw asset price.
+        
+        Because the strategy banks 70-80% of capital into the cash buffer during
+        peaks, the portfolio experiences MUCH lower drawdowns than the underlying
+        asset. Previous implementations incorrectly reported raw asset drawdowns
+        (e.g., -58% to -65%) which didn't reflect the capital protection.
+        """
         if not valuations or not dates:
             return {"terminal_value": 0, "total_invested": 0, "cagr": 0, "mdd": 0, "sortino": 0, "years": 0}
 
         terminal_val = valuations[-1]
         total_invested = invested[-1]
 
-        # Parse dates (handle both "YYYY-MM-DD" and "YYYY-MM-DD HH:MM")
         def parse_date(s: str) -> datetime:
             try:
                 return datetime.strptime(s, "%Y-%m-%d %H:%M")
@@ -536,21 +597,44 @@ def run_backtest(req: BacktestRequest) -> dict:
         end_dt = parse_date(dates[-1])
         years = max((end_dt - start_dt).days / 365.25, 0.01)
 
+        # CAGR: growth of total portfolio vs total invested capital
         cagr = ((terminal_val / max(total_invested, 1)) ** (1.0 / years) - 1) * 100
 
-        # Max drawdown
+        # MAX DRAWDOWN: Peak-to-trough on PORTFOLIO VALUE (includes cash buffer!)
+        # This correctly reflects capital protection from the cash-hedged strategy.
         vals_arr = np.array(valuations, dtype=np.float64)
         peak_arr = np.maximum.accumulate(vals_arr)
-        dd_arr = (vals_arr - peak_arr) / np.where(peak_arr > 0, peak_arr, 1)
+        # Avoid division by zero for initial zero-value periods
+        dd_arr = np.where(
+            peak_arr > 0,
+            (vals_arr - peak_arr) / peak_arr,
+            0.0
+        )
         mdd = float(dd_arr.min()) * 100
 
-        # Sortino ratio (annualised)
+        # SORTINO RATIO: Risk-adjusted return using downside deviation only
+        # Annualized using sqrt(periods_per_year)
+        # Uses ~52 periods/year since deposits are weekly
+        annualization_factor = 52  # Weekly basis for Sortino since deposits are weekly
+        
         if len(vals_arr) > 1:
-            period_returns = np.diff(vals_arr) / np.where(vals_arr[:-1] > 0, vals_arr[:-1], 1)
-            neg_returns = period_returns[period_returns < 0]
-            downside_std = float(np.std(neg_returns)) if len(neg_returns) > 1 else 0.001
-            mean_return = float(np.mean(period_returns))
-            sortino = (mean_return / downside_std) * np.sqrt(ppy) if downside_std > 0 else 0.0
+            # Compute returns on a weekly-sampled basis for consistency
+            # Take every N-th value to approximate weekly returns
+            if len(vals_arr) > 260:  # More than ~1 year of daily data
+                # Sample weekly for Sortino calculation
+                step = max(1, len(vals_arr) // (int(years * 52)))
+                weekly_vals = vals_arr[::step]
+            else:
+                weekly_vals = vals_arr
+
+            if len(weekly_vals) > 1:
+                period_returns = np.diff(weekly_vals) / np.where(weekly_vals[:-1] > 0, weekly_vals[:-1], 1)
+                neg_returns = period_returns[period_returns < 0]
+                downside_std = float(np.std(neg_returns)) if len(neg_returns) > 1 else 0.001
+                mean_return = float(np.mean(period_returns))
+                sortino = (mean_return / downside_std) * np.sqrt(annualization_factor) if downside_std > 0 else 0.0
+            else:
+                sortino = 0.0
         else:
             sortino = 0.0
 

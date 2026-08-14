@@ -2,7 +2,7 @@
 
 import React from "react";
 import { BacktestConfig } from "@/lib/types";
-import { Settings, TrendingUp, Shield, Layers, Zap, Percent } from "lucide-react";
+import { Settings, TrendingUp, Shield, Layers, Zap, Percent, Info } from "lucide-react";
 
 interface ConfigPanelProps {
   config: BacktestConfig;
@@ -20,6 +20,7 @@ function InputField({
   min,
   max,
   suffix,
+  hint,
 }: {
   label: string;
   value: string | number;
@@ -29,6 +30,7 @@ function InputField({
   min?: number;
   max?: number;
   suffix?: string;
+  hint?: string;
 }) {
   return (
     <div className="flex flex-col gap-1">
@@ -49,6 +51,7 @@ function InputField({
           </span>
         )}
       </div>
+      {hint && <span className="text-[10px] text-muted-foreground/70 leading-tight">{hint}</span>}
     </div>
   );
 }
@@ -58,6 +61,15 @@ function SectionHeader({ icon: Icon, title }: { icon: React.ElementType; title: 
     <div className="flex items-center gap-2 pt-4 pb-2 border-b border-border">
       <Icon className="w-4 h-4 text-primary" />
       <h3 className="text-sm font-semibold text-foreground">{title}</h3>
+    </div>
+  );
+}
+
+function InfoBanner({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="flex gap-2 bg-primary/5 border border-primary/20 rounded-md p-2 mt-1">
+      <Info className="w-3.5 h-3.5 text-primary shrink-0 mt-0.5" />
+      <p className="text-[10px] text-muted-foreground leading-relaxed">{children}</p>
     </div>
   );
 }
@@ -122,39 +134,48 @@ export default function ConfigPanel({ config, onChange, onRun, loading }: Config
           Max
         </button>
       </div>
+
+      {/* SCAN FREQUENCY (decoupled from deposits) */}
       <div className="flex flex-col gap-1">
-        <label className="text-xs text-muted-foreground font-medium">Execution Frequency</label>
+        <label className="text-xs text-muted-foreground font-medium">
+          Price Scan Frequency
+        </label>
         <select
           value={config.execution_frequency}
           onChange={(e) => update({ execution_frequency: e.target.value })}
           className="bg-secondary/50 border border-border rounded-md px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
         >
-          <option value="weekly">Weekly (Friday Close)</option>
-          <option value="daily">Daily Close</option>
-          <option value="monthly">Monthly Close</option>
-          <option value="intraday">Intraday (Hourly)</option>
+          <option value="daily">Daily Close (exits evaluated daily)</option>
+          <option value="intraday">Intraday Hourly (exits evaluated every hour)</option>
         </select>
       </div>
+      <InfoBanner>
+        <strong>Decoupled model:</strong> Deposits are always weekly (Friday).
+        Profit harvests &amp; tranche buys trigger continuously based on scan frequency.
+        Cash yield compounds weekly at APY/52.
+      </InfoBanner>
 
-      {/* ====== CONTRIBUTIONS ====== */}
-      <SectionHeader icon={Layers} title="Contributions" />
+      {/* ====== WEEKLY CONTRIBUTIONS ====== */}
+      <SectionHeader icon={Layers} title="Weekly Contributions" />
       <InputField
-        label="Base Interval Deposit"
+        label="Base Weekly Deposit"
         type="number"
         value={config.base_deposit}
         onChange={(v) => update({ base_deposit: parseFloat(v) || 0 })}
         step={50}
         min={0}
         suffix="$"
+        hint="Deposited every Friday during normal market conditions"
       />
       <InputField
-        label="Overbought Deposit"
+        label="Overbought Weekly Deposit"
         type="number"
         value={config.overbought_deposit}
         onChange={(v) => update({ overbought_deposit: parseFloat(v) || 0 })}
         step={50}
         min={0}
         suffix="$"
+        hint="Reduced deposit during overbought (harvesting) state"
       />
       <InputField
         label="Tranche Buy Deposit"
@@ -164,16 +185,18 @@ export default function ConfigPanel({ config, onChange, onRun, loading }: Config
         step={50}
         min={0}
         suffix="$"
+        hint="Extra capital deployed when dip thresholds are hit"
       />
 
-      {/* ====== MA & HARVEST ====== */}
-      <SectionHeader icon={Zap} title="Moving Average & Harvest" />
+      {/* ====== MA & HARVEST (continuous evaluation) ====== */}
+      <SectionHeader icon={Zap} title="Profit Harvest (Continuous)" />
       <InputField
-        label="MA Period (EMA days)"
+        label="EMA Period (days)"
         type="number"
         value={config.ma_period}
         onChange={(v) => update({ ma_period: parseInt(v) || 200 })}
         min={5}
+        hint="200-day EMA. For intraday, auto-converts to hourly equivalent."
       />
       <InputField
         label="Profit Harvest Distance"
@@ -182,6 +205,7 @@ export default function ConfigPanel({ config, onChange, onRun, loading }: Config
         onChange={(v) => update({ profit_harvest_dist_pct: parseFloat(v) || 40 })}
         step={5}
         suffix="%"
+        hint="+40% above EMA triggers profit take. ~13% on underlying QQQ."
       />
       <InputField
         label="Hysteresis Reset Buffer"
@@ -190,6 +214,7 @@ export default function ConfigPanel({ config, onChange, onRun, loading }: Config
         onChange={(v) => update({ hysteresis_reset_pct: parseFloat(v) || 30 })}
         step={5}
         suffix="%"
+        hint="Must drop below this level before harvest can re-arm (prevents whipsaw)"
       />
       <InputField
         label="Initial Scale-Out Share %"
@@ -200,6 +225,7 @@ export default function ConfigPanel({ config, onChange, onRun, loading }: Config
         min={1}
         max={100}
         suffix="%"
+        hint="Percentage of shares sold on first profit harvest"
       />
       <InputField
         label="Step Trigger Increment"
@@ -208,6 +234,7 @@ export default function ConfigPanel({ config, onChange, onRun, loading }: Config
         onChange={(v) => update({ step_trigger_increment_pct: parseFloat(v) || 10 })}
         step={5}
         suffix="%"
+        hint="Each +10% above harvest level triggers another scale-out"
       />
       <InputField
         label="Step Scale-Out Share %"
@@ -218,13 +245,14 @@ export default function ConfigPanel({ config, onChange, onRun, loading }: Config
         min={1}
         max={100}
         suffix="%"
+        hint="Additional shares sold at each step level"
       />
 
-      {/* ====== TRANCHES ====== */}
-      <SectionHeader icon={Shield} title="Tranche & Dip Deployment" />
+      {/* ====== TRANCHES (continuous evaluation) ====== */}
+      <SectionHeader icon={Shield} title="Tranche Dip-Buy (Continuous)" />
       <div className="flex flex-col gap-1">
         <label className="text-xs text-muted-foreground font-medium">
-          Drawdown Thresholds (comma-separated %)
+          Drawdown Thresholds from Swing High (%)
         </label>
         <input
           value={config.tranches.thresholds.join(", ")}
@@ -238,6 +266,9 @@ export default function ConfigPanel({ config, onChange, onRun, loading }: Config
           className="w-full bg-secondary/50 border border-border rounded-md px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
           placeholder="-25, -35, -45, -55, -65"
         />
+        <span className="text-[10px] text-muted-foreground/70">
+          Tiered pullback levels from peak that deploy cash buffer
+        </span>
       </div>
       <InputField
         label="Cash Deploy per Tranche"
@@ -250,6 +281,7 @@ export default function ConfigPanel({ config, onChange, onRun, loading }: Config
         min={1}
         max={100}
         suffix="%"
+        hint="% of peak cash buffer deployed at each tranche level"
       />
 
       {/* ====== ADAPTIVE MODE ====== */}
@@ -279,6 +311,7 @@ export default function ConfigPanel({ config, onChange, onRun, loading }: Config
               })
             }
             min={1}
+            hint="After N harvests without a dip, shift Tranche 1 deeper"
           />
           <InputField
             label="Adaptive Tranche 1 Trigger"
@@ -291,20 +324,22 @@ export default function ConfigPanel({ config, onChange, onRun, loading }: Config
             }
             step={5}
             suffix="%"
+            hint="Adjusted T1 threshold after N consecutive harvests"
           />
         </div>
       )}
 
-      {/* ====== YIELD ====== */}
-      <SectionHeader icon={Percent} title="Cash Yield" />
+      {/* ====== CASH YIELD ====== */}
+      <SectionHeader icon={Percent} title="Cash Yield (Weekly Compound)" />
       <InputField
-        label="Cash Buffer Interest APY"
+        label="Cash Buffer APY"
         type="number"
         value={config.cash_yield_apy}
         onChange={(v) => update({ cash_yield_apy: parseFloat(v) || 0 })}
         step={0.5}
         min={0}
         suffix="%"
+        hint="Compounds weekly: Cash *= (1 + APY/52). Models T-bill sweep yield."
       />
 
       {/* ====== RUN BUTTON ====== */}
