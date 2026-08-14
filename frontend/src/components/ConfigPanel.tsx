@@ -132,6 +132,7 @@ export default function ConfigPanel({ config, onChange, onRun, loading }: Config
           <option value="weekly">Weekly (Friday Close)</option>
           <option value="daily">Daily Close</option>
           <option value="monthly">Monthly Close</option>
+          <option value="intraday">Intraday (Hourly)</option>
         </select>
       </div>
 
