@@ -135,7 +135,7 @@ export default function ConfigPanel({ config, onChange, onRun, loading }: Config
         </button>
       </div>
 
-      {/* SCAN FREQUENCY (decoupled from deposits) */}
+      {/* EXECUTION FREQUENCY */}
       <div className="flex flex-col gap-1">
         <label className="text-xs text-muted-foreground font-medium">
           Execution Frequency
@@ -145,14 +145,14 @@ export default function ConfigPanel({ config, onChange, onRun, loading }: Config
           onChange={(e) => update({ execution_frequency: e.target.value })}
           className="bg-secondary/50 border border-border rounded-md px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
         >
-          <option value="weekly">Weekly (Friday Close)</option>
-          <option value="daily">Daily Close</option>
+          <option value="daily">Daily (exits daily, deposits Friday)</option>
           <option value="intraday">Intraday Hourly</option>
         </select>
       </div>
       <InfoBanner>
-        <strong>Weekly mode (recommended):</strong> All logic — deposits, profit harvests,
-        tranche buys — evaluated exclusively on Friday close. Matches research PDF methodology.
+        <strong>Hybrid model:</strong> Profit harvests &amp; tranche buys execute the day
+        the signal fires. DCA deposits occur on Fridays only ($200/$100/$400).
+        Cash yield compounds weekly.
       </InfoBanner>
 
       {/* ====== WEEKLY CONTRIBUTIONS ====== */}

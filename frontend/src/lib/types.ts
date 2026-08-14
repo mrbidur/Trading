@@ -69,7 +69,7 @@ export const DEFAULT_CONFIG: BacktestConfig = {
   ticker: "TQQQ",
   start_date: "2010-01-01",
   end_date: "",
-  execution_frequency: "weekly",
+  execution_frequency: "daily",
   base_deposit: 200,
   overbought_deposit: 100,
   tranche_deposit: 400,
@@ -84,7 +84,7 @@ export const DEFAULT_CONFIG: BacktestConfig = {
     cash_deploy_pct: 20,
   },
   adaptive: {
-    enabled: false,
+    enabled: true,
     n_harvest_target: 3,
     adaptive_tranche_1: -20,
   },
