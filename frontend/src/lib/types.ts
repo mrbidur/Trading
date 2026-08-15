@@ -67,7 +67,7 @@ export interface BacktestResult {
 
 export const DEFAULT_CONFIG: BacktestConfig = {
   ticker: "TQQQ",
-  start_date: "2010-01-01",
+  start_date: "2010-02-12",
   end_date: "",
   execution_frequency: "daily",
   base_deposit: 200,
