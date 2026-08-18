@@ -87,7 +87,7 @@ pullback_pct = swing_high_peak > 0 ? ((close - swing_high_peak) / swing_high_pea
 // Weekly boundary
 current_week = weekofyear(time)
 current_year = year(time)
-is_friday = (dayofweek(time) == dayofweek.friday)
+is_monday = (dayofweek(time) == dayofweek.monday)
 new_week = (current_week != week_tracked) or (current_year != year_tracked)
 
 // Daily yield factor
@@ -229,23 +229,23 @@ else if pullback_pct <= t4_threshold and t3_fired and not t4_fired and swing_hig
     bar_deposit := tranche_deposit
     bar_action := "TRANCHE 4"
 
-// --- PHASE 5: Friday DCA ---
-if is_friday and (current_week != last_deposit_week or current_year != last_deposit_year)
+// --- PHASE 5: Monday DCA ---
+if is_monday and (current_week != last_deposit_week or current_year != last_deposit_year)
     last_deposit_week := current_week
     last_deposit_year := current_year
     
-    float friday_deposit = 0.0
+    float monday_deposit = 0.0
     if tranche_this_week
-        friday_deposit := 0.0
+        monday_deposit := 0.0
     else if in_overbought
-        friday_deposit := ob_deposit
+        monday_deposit := ob_deposit
     else
-        friday_deposit := base_deposit
+        monday_deposit := base_deposit
     
-    if friday_deposit > 0
-        total_shares := total_shares + (friday_deposit / close)
-        total_oop := total_oop + friday_deposit
-        bar_deposit := bar_deposit + friday_deposit
+    if monday_deposit > 0
+        total_shares := total_shares + (monday_deposit / open)
+        total_oop := total_oop + monday_deposit
+        bar_deposit := bar_deposit + monday_deposit
         if bar_action == "HOLD"
             bar_action := in_overbought ? "DCA (OB)" : "DCA"
 

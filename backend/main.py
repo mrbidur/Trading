@@ -233,7 +233,7 @@ def run_backtest(req: BacktestRequest) -> dict:
 
         dist_pct = ((price - ema) / ema) * 100.0
         current_dt = exec_date.to_pydatetime() if hasattr(exec_date, 'to_pydatetime') else exec_date
-        is_friday = (current_dt.weekday() == 4)
+        is_monday = (current_dt.weekday() == 0)
         current_week_key = (current_dt.isocalendar()[0], current_dt.isocalendar()[1])
 
         # Reset weekly tranche flag
@@ -386,26 +386,27 @@ def run_backtest(req: BacktestRequest) -> dict:
                 break
 
         # ===================================================================
-        # PHASE 6: FRIDAY DCA DEPOSIT
+        # PHASE 6: MONDAY OPEN DCA DEPOSIT
         # Strictly limited to regular weekly contribution purchases.
+        # Executes at Monday's open price.
         # Deposit amount based on state:
         #   Normal: $200 | Overbought: $100 | Tranche week: $0 (already $400)
         # ===================================================================
-        if is_friday and last_deposit_week != current_week_key:
+        if is_monday and last_deposit_week != current_week_key:
             last_deposit_week = current_week_key
 
             if tranche_fired_this_week:
-                friday_deposit = 0.0
+                monday_deposit = 0.0
             elif in_overbought:
-                friday_deposit = req.overbought_deposit
+                monday_deposit = req.overbought_deposit
             else:
-                friday_deposit = req.base_deposit
+                monday_deposit = req.base_deposit
 
-            if friday_deposit > 0:
-                shares_bought = friday_deposit / price
+            if monday_deposit > 0:
+                shares_bought = monday_deposit / price
                 total_shares += shares_bought
-                total_out_of_pocket += friday_deposit
-                deposit += friday_deposit
+                total_out_of_pocket += monday_deposit
+                deposit += monday_deposit
                 if action == "HOLD":
                     action = "WEEKLY DCA" if not in_overbought else "WEEKLY DCA (OB)"
 
