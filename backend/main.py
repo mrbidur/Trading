@@ -74,6 +74,14 @@ class AdaptiveConfig(BaseModel):
     adaptive_tranche_1: float = Field(default=-20.0, le=0.0)
 
 
+class DualGateConfig(BaseModel):
+    enabled: bool = Field(default=False, description="Enable dual-gate NDX + EMA filter")
+    benchmark_ticker: str = Field(default="^NDX", description="Benchmark index ticker (Nasdaq-100)")
+    risk_off_exit: bool = Field(default=True, description="Sell all shares when both gates fail")
+    pause_dca_when_closed: bool = Field(default=True, description="Pause weekly DCA when gate is closed")
+    pause_tranches_when_closed: bool = Field(default=True, description="Pause tranche buys when gate is closed")
+
+
 class BacktestRequest(BaseModel):
     # Asset / timeframe
     ticker: str = Field(default="TQQQ")
@@ -81,7 +89,7 @@ class BacktestRequest(BaseModel):
     end_date: str = Field(default="")
     execution_frequency: str = Field(default="daily")
 
-    # Contributions (deposited on Fridays only)
+    # Contributions (deposited on Mondays)
     base_deposit: float = Field(default=200.0, ge=0.0)
     overbought_deposit: float = Field(default=100.0, ge=0.0)
     tranche_deposit: float = Field(default=400.0, ge=0.0)
@@ -99,6 +107,9 @@ class BacktestRequest(BaseModel):
 
     # Adaptive mode
     adaptive: AdaptiveConfig = Field(default_factory=AdaptiveConfig)
+
+    # Dual-gate filter
+    dual_gate: DualGateConfig = Field(default_factory=DualGateConfig)
 
     # Yield (compounds DAILY at APY/252)
     cash_yield_apy: float = Field(default=4.5, ge=0.0)
@@ -193,6 +204,23 @@ def run_backtest(req: BacktestRequest) -> dict:
             detail=f"No data for {req.ticker} in range {req.start_date} to {end_date}"
         )
 
+    # -----------------------------------------------------------------------
+    # DUAL-GATE: Fetch benchmark (NDX) data if enabled
+    # -----------------------------------------------------------------------
+    ndx_ema_series = None
+    ndx_close_series = None
+    if req.dual_gate.enabled:
+        try:
+            ndx_df = fetch_price_data(req.dual_gate.benchmark_ticker, req.start_date, end_date)
+            ndx_df["NDX_EMA"] = ndx_df["Close"].ewm(span=req.ma_period, adjust=False).mean()
+            ndx_df = ndx_df.dropna(subset=["NDX_EMA"])
+            ndx_close_series = ndx_df["Close"]
+            ndx_ema_series = ndx_df["NDX_EMA"]
+        except Exception as e:
+            print(f"[WARN] Could not fetch benchmark {req.dual_gate.benchmark_ticker}: {e}")
+            # Disable dual-gate if benchmark data unavailable
+            req.dual_gate.enabled = False
+
     # Daily cash yield factor: APY/252 per trading day
     daily_yield_factor = (1 + req.cash_yield_apy / 100.0) ** (1.0 / 252.0)
 
@@ -217,6 +245,9 @@ def run_backtest(req: BacktestRequest) -> dict:
     # DCA baseline
     dca_shares = 0.0
     dca_out_of_pocket = 0.0
+
+    # Dual-gate state
+    risk_off_active = False
 
     rows: List[dict] = []
     dca_rows: List[dict] = []
@@ -254,6 +285,40 @@ def run_backtest(req: BacktestRequest) -> dict:
         # ===================================================================
         if cash_buffer > 0:
             cash_buffer *= daily_yield_factor
+
+        # ===================================================================
+        # PHASE 1.5: DUAL-GATE EVALUATION
+        # Gate 1: Price > its own 200 EMA
+        # Gate 2: NDX > NDX's 200 EMA
+        # Both must be true for buying. Both false = risk-off exit.
+        # ===================================================================
+        gate_above_ema = price > ema
+        gate_ndx_bullish = True  # Default if dual-gate disabled
+
+        if req.dual_gate.enabled and ndx_close_series is not None and ndx_ema_series is not None:
+            # Look up NDX value for this date
+            if exec_date in ndx_close_series.index and exec_date in ndx_ema_series.index:
+                ndx_price = float(ndx_close_series.loc[exec_date])
+                ndx_ema_val = float(ndx_ema_series.loc[exec_date])
+                gate_ndx_bullish = ndx_price > ndx_ema_val
+            else:
+                gate_ndx_bullish = True  # No data for this date, assume open
+
+        dual_gate_open = gate_above_ema and gate_ndx_bullish
+        both_gates_failed = (not gate_above_ema) and (not gate_ndx_bullish)
+
+        # RISK-OFF EXIT: Both gates failed — sell everything
+        if req.dual_gate.enabled and req.dual_gate.risk_off_exit and both_gates_failed and total_shares > 0 and not risk_off_active:
+            risk_off_active = True
+            cash_buffer += total_shares * price
+            total_shares = 0.0
+            in_overbought = False
+            active_step_triggers = []
+            action = "RISK-OFF EXIT"
+
+        # Reset risk-off when dual gate reopens
+        if dual_gate_open and risk_off_active:
+            risk_off_active = False
 
         # ===================================================================
         # PHASE 2: HYSTERESIS RESET (DAILY evaluation)
@@ -356,34 +421,41 @@ def run_backtest(req: BacktestRequest) -> dict:
             else 0.0
         )
 
-        for t_idx, trigger_level in enumerate(active_tranches):
-            if t_idx >= len(tranches_triggered):
-                break
-            # Sequential gating: T2 requires T1 fired, T3 requires T2 fired, etc.
-            if t_idx > 0 and not tranches_triggered[t_idx - 1]:
-                break
-            if pullback_pct <= trigger_level and not tranches_triggered[t_idx]:
-                tranches_triggered[t_idx] = True
-                tranche_fired_today = True
-                tranche_fired_this_week = True
-                n_harvest = 0  # Reset adaptive counter
+        # Dual-gate check: skip tranche buys if gate closed and setting enabled
+        tranche_buying_allowed = True
+        if req.dual_gate.enabled and req.dual_gate.pause_tranches_when_closed:
+            if not dual_gate_open or risk_off_active:
+                tranche_buying_allowed = False
 
-                # Deploy from anchored peak buffer
-                deploy_from_buffer = min(
-                    peak_cash_buffer * (req.tranches.cash_deploy_pct / 100.0),
-                    cash_buffer
-                )
-                tranche_deposit_amount = req.tranche_deposit
-                total_buy_amount = deploy_from_buffer + tranche_deposit_amount
+        if tranche_buying_allowed:
+            for t_idx, trigger_level in enumerate(active_tranches):
+                if t_idx >= len(tranches_triggered):
+                    break
+                # Sequential gating: T2 requires T1 fired, T3 requires T2 fired, etc.
+                if t_idx > 0 and not tranches_triggered[t_idx - 1]:
+                    break
+                if pullback_pct <= trigger_level and not tranches_triggered[t_idx]:
+                    tranches_triggered[t_idx] = True
+                    tranche_fired_today = True
+                    tranche_fired_this_week = True
+                    n_harvest = 0  # Reset adaptive counter
 
-                shares_bought = total_buy_amount / price
-                total_shares += shares_bought
-                cash_buffer -= deploy_from_buffer
-                total_out_of_pocket += tranche_deposit_amount
-                deposit = tranche_deposit_amount
+                    # Deploy from anchored peak buffer
+                    deploy_from_buffer = min(
+                        peak_cash_buffer * (req.tranches.cash_deploy_pct / 100.0),
+                        cash_buffer
+                    )
+                    tranche_deposit_amount = req.tranche_deposit
+                    total_buy_amount = deploy_from_buffer + tranche_deposit_amount
 
-                action = f"TRANCHE {t_idx + 1} BUY ({trigger_level:.0f}%)"
-                break
+                    shares_bought = total_buy_amount / price
+                    total_shares += shares_bought
+                    cash_buffer -= deploy_from_buffer
+                    total_out_of_pocket += tranche_deposit_amount
+                    deposit = tranche_deposit_amount
+
+                    action = f"TRANCHE {t_idx + 1} BUY ({trigger_level:.0f}%)"
+                    break
 
         # ===================================================================
         # PHASE 6: MONDAY OPEN DCA DEPOSIT
@@ -395,7 +467,15 @@ def run_backtest(req: BacktestRequest) -> dict:
         if is_monday and last_deposit_week != current_week_key:
             last_deposit_week = current_week_key
 
+            # Dual-gate check: skip DCA if gate closed and setting enabled
+            dca_allowed = True
+            if req.dual_gate.enabled and req.dual_gate.pause_dca_when_closed:
+                if not dual_gate_open or risk_off_active:
+                    dca_allowed = False
+
             if tranche_fired_this_week:
+                monday_deposit = 0.0
+            elif not dca_allowed:
                 monday_deposit = 0.0
             elif in_overbought:
                 monday_deposit = req.overbought_deposit
