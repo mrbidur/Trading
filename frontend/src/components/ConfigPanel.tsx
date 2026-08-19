@@ -330,7 +330,7 @@ export default function ConfigPanel({ config, onChange, onRun, loading }: Config
       )}
 
       {/* ====== CASH YIELD ====== */}
-      <SectionHeader icon={Percent} title="Cash Yield (Weekly Compound)" />
+      <SectionHeader icon={Percent} title="Cash Yield" />
       <InputField
         label="Cash Buffer APY"
         type="number"
@@ -339,8 +339,83 @@ export default function ConfigPanel({ config, onChange, onRun, loading }: Config
         step={0.5}
         min={0}
         suffix="%"
-        hint="Compounds weekly: Cash *= (1 + APY/52). Models T-bill sweep yield."
+        hint="Compounds daily: Cash *= (1 + APY/252). Models T-bill sweep yield."
       />
+
+      {/* ====== DUAL-GATE FILTER ====== */}
+      <SectionHeader icon={Shield} title="Dual-Gate Filter (NDX + EMA)" />
+      <div className="flex items-center gap-2">
+        <input
+          type="checkbox"
+          id="dual-gate-toggle"
+          checked={config.dual_gate.enabled}
+          onChange={(e) =>
+            update({ dual_gate: { ...config.dual_gate, enabled: e.target.checked } })
+          }
+          className="w-4 h-4 rounded border-border bg-secondary accent-primary"
+        />
+        <label htmlFor="dual-gate-toggle" className="text-xs text-muted-foreground font-medium cursor-pointer">
+          Enable Dual-Gate Filter
+        </label>
+      </div>
+      {config.dual_gate.enabled && (
+        <div className="ml-4 flex flex-col gap-2 border-l-2 border-primary/30 pl-3">
+          <InputField
+            label="Benchmark Ticker"
+            value={config.dual_gate.benchmark_ticker}
+            onChange={(v) =>
+              update({ dual_gate: { ...config.dual_gate, benchmark_ticker: v } })
+            }
+            hint="Nasdaq-100 = ^NDX, S&P 500 = ^GSPC"
+          />
+          <div className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              id="risk-off-toggle"
+              checked={config.dual_gate.risk_off_exit}
+              onChange={(e) =>
+                update({ dual_gate: { ...config.dual_gate, risk_off_exit: e.target.checked } })
+              }
+              className="w-4 h-4 rounded border-border bg-secondary accent-primary"
+            />
+            <label htmlFor="risk-off-toggle" className="text-[11px] text-muted-foreground cursor-pointer">
+              Risk-Off Exit (sell all when both gates fail)
+            </label>
+          </div>
+          <div className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              id="pause-dca-toggle"
+              checked={config.dual_gate.pause_dca_when_closed}
+              onChange={(e) =>
+                update({ dual_gate: { ...config.dual_gate, pause_dca_when_closed: e.target.checked } })
+              }
+              className="w-4 h-4 rounded border-border bg-secondary accent-primary"
+            />
+            <label htmlFor="pause-dca-toggle" className="text-[11px] text-muted-foreground cursor-pointer">
+              Pause DCA when gate closed
+            </label>
+          </div>
+          <div className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              id="pause-tranche-toggle"
+              checked={config.dual_gate.pause_tranches_when_closed}
+              onChange={(e) =>
+                update({ dual_gate: { ...config.dual_gate, pause_tranches_when_closed: e.target.checked } })
+              }
+              className="w-4 h-4 rounded border-border bg-secondary accent-primary"
+            />
+            <label htmlFor="pause-tranche-toggle" className="text-[11px] text-muted-foreground cursor-pointer">
+              Pause Tranches when gate closed
+            </label>
+          </div>
+          <InfoBanner>
+            <strong>Gate 1:</strong> Price &gt; 200 EMA. <strong>Gate 2:</strong> NDX &gt; NDX 200 EMA.
+            Both open = buying active. Both closed = risk-off exit.
+          </InfoBanner>
+        </div>
+      )}
 
       {/* ====== RUN BUTTON ====== */}
       <button

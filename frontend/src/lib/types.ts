@@ -21,6 +21,13 @@ export interface BacktestConfig {
     n_harvest_target: number;
     adaptive_tranche_1: number;
   };
+  dual_gate: {
+    enabled: boolean;
+    benchmark_ticker: string;
+    risk_off_exit: boolean;
+    pause_dca_when_closed: boolean;
+    pause_tranches_when_closed: boolean;
+  };
   cash_yield_apy: number;
 }
 
@@ -87,6 +94,13 @@ export const DEFAULT_CONFIG: BacktestConfig = {
     enabled: true,
     n_harvest_target: 3,
     adaptive_tranche_1: -20,
+  },
+  dual_gate: {
+    enabled: false,
+    benchmark_ticker: "^NDX",
+    risk_off_exit: true,
+    pause_dca_when_closed: true,
+    pause_tranches_when_closed: true,
   },
   cash_yield_apy: 4.5,
 };
