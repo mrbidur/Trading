@@ -1,12 +1,11 @@
 """
-QQQ/TQQQ Dynamic DCA + Switching Strategy — Streamlit Web App
-===============================================================
-Weekly DCA into QQQ with multi-tier switching into TQQQ based on
-TQQQ's distance below its 200-day EMA.
+QQQ/TQQQ Two-Way Asset Rotation Strategy — Streamlit Web App
+==============================================================
+Weekly DCA into QQQ with:
+  - DOWNWARD ENTRY: Multi-tier switching QQQ → TQQQ when TQQQ drops below EMA
+  - UPWARD EXIT: Full rotation TQQQ → QQQ when TQQQ surges above EMA
 
-NO lump-sum. Weekly $200 DCA accumulates QQQ continuously.
-When TQQQ drops below EMA by configured tiers, transfer portions
-of QQQ holdings into TQQQ. Reset when TQQQ recovers above EMA.
+All thresholds are adjustable via interactive sliders.
 
 Run: streamlit run streamlit_switching_app.py
 """
@@ -23,8 +22,8 @@ import io
 # PAGE CONFIG
 # =============================================================================
 st.set_page_config(
-    page_title="QQQ/TQQQ DCA + Switching Backtest",
-    page_icon="📊",
+    page_title="QQQ/TQQQ Two-Way Rotation Backtest",
+    page_icon="🔄",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -45,13 +44,11 @@ def fetch_data(base_ticker: str, lev_ticker: str, start: str, end: str) -> pd.Da
     if base_df.empty or lev_df.empty:
         return pd.DataFrame()
 
-    # Handle MultiIndex columns
     if isinstance(base_df.columns, pd.MultiIndex):
         base_df.columns = base_df.columns.get_level_values(0)
     if isinstance(lev_df.columns, pd.MultiIndex):
         lev_df.columns = lev_df.columns.get_level_values(0)
 
-    # Timezone-naive
     if base_df.index.tz is not None:
         base_df.index = base_df.index.tz_localize(None)
     if lev_df.index.tz is not None:
@@ -66,32 +63,41 @@ def fetch_data(base_ticker: str, lev_ticker: str, start: str, end: str) -> pd.Da
 
 
 # =============================================================================
-# BACKTEST ENGINE — Weekly DCA + Multi-Tier Switching
+# BACKTEST ENGINE — Two-Way Rotation
 # =============================================================================
 def run_backtest(
     data: pd.DataFrame,
     ema_period: int,
     weekly_dca: float,
-    drawdown_tiers: List[float],
-    transfer_pct: float,
+    entry_tiers: List[float],
+    entry_transfer_pct: float,
+    exit_threshold: float,
     reset_threshold: float,
 ) -> pd.DataFrame:
     """
-    Weekly DCA + Multi-Tier Switching Strategy.
+    Two-Way Asset Rotation Strategy:
 
-    Rules:
-    1. Every Monday (or first trading day of the week): inject $weekly_dca
-       and buy QQQ shares at that day's close price.
-    2. Calculate TQQQ's 200-day EMA and % distance from it daily.
-    3. When TQQQ's distance crosses below each tier threshold, transfer
-       transfer_pct% of current QQQ holdings into TQQQ.
-    4. When TQQQ recovers above EMA (dist > reset_threshold), reset all
-       tier flags for the next drawdown cycle.
-    5. Track daily: shares held, values, portfolio total vs benchmark.
+    WEEKLY DCA:
+      Every new week → deposit $weekly_dca → buy QQQ
+
+    DOWNWARD ENTRY (QQQ → TQQQ):
+      When TQQQ's EMA distance crosses below each entry tier,
+      transfer entry_transfer_pct% of QQQ holdings into TQQQ.
+      Tiers fire sequentially, once per cycle.
+
+    UPWARD EXIT / PROFIT-BOOKING (TQQQ → QQQ):
+      When TQQQ's EMA distance surges above exit_threshold,
+      sell ALL TQQQ shares and rotate proceeds back into QQQ.
+      This locks in leveraged gains and resets to base exposure.
+
+    RESET:
+      Entry tier flags reset when TQQQ recovers above reset_threshold
+      (allowing re-entry on the next drawdown cycle).
+      Exit can fire independently whenever the threshold is crossed.
     """
     data = data.copy()
 
-    # Compute EMA on TQQQ (the signal asset)
+    # Compute EMA on TQQQ
     data["tqqq_ema"] = data["tqqq_close"].ewm(span=ema_period, adjust=False).mean()
     data["ema_dist_pct"] = ((data["tqqq_close"] - data["tqqq_ema"]) / data["tqqq_ema"]) * 100.0
     data = data.dropna()
@@ -103,13 +109,16 @@ def run_backtest(
     qqq_shares = 0.0
     tqqq_shares = 0.0
     total_invested = 0.0
-    n_tiers = len(drawdown_tiers)
+    n_tiers = len(entry_tiers)
     tiers_triggered = [False] * n_tiers
     last_dca_week = None
 
-    # Benchmark: pure QQQ DCA (same weekly amount, no switching)
+    # Benchmark: pure QQQ DCA (same weekly amount, no rotation)
     bench_qqq_shares = 0.0
     bench_invested = 0.0
+
+    # Track profit-booking events
+    exit_armed = True  # Can fire exit anytime TQQQ is held
 
     rows = []
 
@@ -141,27 +150,48 @@ def run_backtest(
             bench_qqq_shares += deposit / qqq_price
             bench_invested += deposit
 
-            if action == "HOLD":
-                action = "DCA"
+            action = "DCA"
 
         # ----------------------------------------------------------
-        # RESET: When TQQQ recovers above EMA
+        # UPWARD EXIT: TQQQ → QQQ (Profit Booking)
+        # When TQQQ surges above the exit threshold, sell ALL TQQQ
+        # and rotate proceeds back into QQQ to lock in profits.
         # ----------------------------------------------------------
-        if dist_pct > reset_threshold:
-            if any(tiers_triggered):
-                action = "RESET"
+        if dist_pct >= exit_threshold and tqqq_shares > 0:
+            # Sell all TQQQ
+            cash_from_tqqq = tqqq_shares * tqqq_price
+            # Buy QQQ with proceeds
+            qqq_bought = cash_from_tqqq / qqq_price
+            qqq_shares += qqq_bought
+            transfer_amount = cash_from_tqqq
+
+            tqqq_shares = 0.0
+            action = f"EXIT (+{exit_threshold:.0f}%)"
+
+            # Reset entry tiers after profit-booking (ready for next cycle)
             tiers_triggered = [False] * n_tiers
 
         # ----------------------------------------------------------
-        # TIER SWITCHING: Transfer QQQ → TQQQ at each tier
+        # ENTRY TIER RESET: When TQQQ recovers above reset threshold
+        # ----------------------------------------------------------
+        elif dist_pct > reset_threshold:
+            if any(tiers_triggered):
+                if action == "DCA":
+                    action = "DCA + RESET"
+                else:
+                    action = "RESET"
+            tiers_triggered = [False] * n_tiers
+
+        # ----------------------------------------------------------
+        # DOWNWARD ENTRY: QQQ → TQQQ (Tier Switching)
         # ----------------------------------------------------------
         else:
-            for t_idx, thresh in enumerate(drawdown_tiers):
+            for t_idx, thresh in enumerate(entry_tiers):
                 if dist_pct <= thresh and not tiers_triggered[t_idx] and qqq_shares > 0:
                     tiers_triggered[t_idx] = True
 
-                    # Transfer transfer_pct% of current QQQ holdings to TQQQ
-                    shares_to_sell = qqq_shares * (transfer_pct / 100.0)
+                    # Transfer % of QQQ holdings into TQQQ
+                    shares_to_sell = qqq_shares * (entry_transfer_pct / 100.0)
                     cash_from_sale = shares_to_sell * qqq_price
                     tqqq_bought = cash_from_sale / tqqq_price
 
@@ -169,7 +199,8 @@ def run_backtest(
                     tqqq_shares += tqqq_bought
                     transfer_amount = cash_from_sale
 
-                    action = f"TIER {t_idx + 1} ({thresh:.0f}%)"
+                    tier_action = f"ENTRY T{t_idx + 1} ({thresh:.0f}%)"
+                    action = tier_action if action == "HOLD" else f"DCA + {tier_action}"
                     break  # Only one tier per day
 
         # ----------------------------------------------------------
@@ -179,6 +210,10 @@ def run_backtest(
         tqqq_value = tqqq_shares * tqqq_price
         total_portfolio = qqq_value + tqqq_value
         benchmark_value = bench_qqq_shares * qqq_price
+
+        # Allocation percentages
+        qqq_alloc = (qqq_value / total_portfolio * 100) if total_portfolio > 0 else 100
+        tqqq_alloc = (tqqq_value / total_portfolio * 100) if total_portfolio > 0 else 0
 
         rows.append({
             "Date": dt.strftime("%Y-%m-%d"),
@@ -193,6 +228,8 @@ def run_backtest(
             "Portfolio Value ($)": round(total_portfolio, 2),
             "Benchmark (QQQ DCA)": round(benchmark_value, 2),
             "Total Invested ($)": round(total_invested, 2),
+            "QQQ Alloc %": round(qqq_alloc, 1),
+            "TQQQ Alloc %": round(tqqq_alloc, 1),
             "Tiers Active": sum(tiers_triggered),
             "Action": action,
             "Deposit ($)": round(deposit, 2),
@@ -206,7 +243,6 @@ def run_backtest(
 # METRICS
 # =============================================================================
 def compute_metrics(results: pd.DataFrame) -> dict:
-    """Compute performance metrics."""
     if results.empty:
         return {}
 
@@ -223,11 +259,10 @@ def compute_metrics(results: pd.DataFrame) -> dict:
         0.01,
     )
 
-    # Return on invested capital
     roi_strat = (final_strat / total_invested - 1) * 100
     roi_bench = (final_bench / total_invested - 1) * 100
 
-    # MDD (skip first year warmup)
+    # MDD
     warmup = min(252, len(vals) // 4)
     mdd_vals = vals[warmup:]
     if len(mdd_vals) > 0:
@@ -243,9 +278,9 @@ def compute_metrics(results: pd.DataFrame) -> dict:
     else:
         mdd_bench = 0.0
 
-    switches = results[results["Action"].str.contains("TIER")].shape[0]
-    resets = results[results["Action"] == "RESET"].shape[0]
-    dca_count = results[results["Action"] == "DCA"].shape[0]
+    entries = results[results["Action"].str.contains("ENTRY")].shape[0]
+    exits = results[results["Action"].str.contains("EXIT")].shape[0]
+    resets = results[results["Action"].str.contains("RESET")].shape[0]
 
     return {
         "total_invested": total_invested,
@@ -256,22 +291,23 @@ def compute_metrics(results: pd.DataFrame) -> dict:
         "mdd_strategy": mdd_strat,
         "mdd_benchmark": mdd_bench,
         "years": years,
-        "switches": switches,
+        "entries": entries,
+        "exits": exits,
         "resets": resets,
-        "dca_weeks": dca_count,
         "alpha": final_strat - final_bench,
+        "alpha_pct": (final_strat / final_bench - 1) * 100 if final_bench > 0 else 0,
     }
 
 
 # =============================================================================
 # SIDEBAR — INTERACTIVE CONTROLS
 # =============================================================================
-st.sidebar.title("⚙️ Strategy Parameters")
+st.sidebar.title("🔄 Two-Way Rotation")
 
 st.sidebar.markdown("### 💰 Weekly DCA")
 weekly_dca = st.sidebar.slider(
     "Weekly Deposit ($)", min_value=50, max_value=2000, value=200, step=50,
-    help="Amount invested into QQQ every week"
+    help="Fixed amount invested into QQQ every week"
 )
 
 st.sidebar.markdown("### 📅 Timeline")
@@ -281,24 +317,34 @@ end_date = st.sidebar.date_input("End Date", value=date.today())
 st.sidebar.markdown("### 📈 EMA Settings")
 ema_period = st.sidebar.slider(
     "EMA Period (days)", min_value=10, max_value=500, value=200, step=10,
-    help="200-day EMA calculated on TQQQ price"
+    help="Calculated on TQQQ price"
 )
 
-st.sidebar.markdown("### 📉 Drawdown Tiers")
-st.sidebar.caption("TQQQ % below its 200 EMA that triggers each switch")
-tier1 = st.sidebar.slider("Tier 1 (%)", min_value=-80, max_value=0, value=-20, step=5)
-tier2 = st.sidebar.slider("Tier 2 (%)", min_value=-80, max_value=0, value=-30, step=5)
-tier3 = st.sidebar.slider("Tier 3 (%)", min_value=-80, max_value=0, value=-40, step=5)
-tier4 = st.sidebar.slider("Tier 4 (%)", min_value=-80, max_value=0, value=-50, step=5)
-
-st.sidebar.markdown("### 🔄 Transfer Settings")
-transfer_pct = st.sidebar.slider(
-    "Transfer % of QQQ per Tier", min_value=5, max_value=100, value=25, step=5,
+st.sidebar.markdown("---")
+st.sidebar.markdown("### 📉 DOWNWARD ENTRY (QQQ → TQQQ)")
+st.sidebar.caption("When TQQQ drops below EMA by these %s, move QQQ into TQQQ")
+tier1 = st.sidebar.slider("Entry Tier 1 (%)", min_value=-80, max_value=0, value=-20, step=5)
+tier2 = st.sidebar.slider("Entry Tier 2 (%)", min_value=-80, max_value=0, value=-30, step=5)
+tier3 = st.sidebar.slider("Entry Tier 3 (%)", min_value=-80, max_value=0, value=-40, step=5)
+tier4 = st.sidebar.slider("Entry Tier 4 (%)", min_value=-80, max_value=0, value=-50, step=5)
+entry_transfer_pct = st.sidebar.slider(
+    "Transfer % per Entry Tier", min_value=5, max_value=100, value=25, step=5,
     help="% of current QQQ holdings moved to TQQQ at each tier"
 )
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("### 📈 UPWARD EXIT (TQQQ → QQQ)")
+st.sidebar.caption("When TQQQ surges above EMA by this %, sell ALL TQQQ back to QQQ")
+exit_threshold = st.sidebar.slider(
+    "Profit-Booking Threshold (%)", min_value=10, max_value=150, value=40, step=5,
+    help="TQQQ distance above EMA that triggers full rotation back to QQQ"
+)
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("### 🔁 Reset")
 reset_threshold = st.sidebar.slider(
-    "Reset Threshold (%)", min_value=-10, max_value=20, value=0, step=1,
-    help="TQQQ EMA distance above which tier flags reset"
+    "Entry Reset Threshold (%)", min_value=-10, max_value=20, value=0, step=1,
+    help="EMA dist above which entry tier flags reset for next cycle"
 )
 
 st.sidebar.markdown("---")
@@ -308,17 +354,17 @@ run_button = st.sidebar.button("🚀 Run Backtest", use_container_width=True, ty
 # =============================================================================
 # MAIN AREA
 # =============================================================================
-st.title("📊 QQQ/TQQQ Weekly DCA + Switching Strategy")
+st.title("🔄 QQQ/TQQQ Two-Way Asset Rotation")
 st.caption(
-    f"Weekly ${weekly_dca} DCA into QQQ | "
-    f"Switch to TQQQ when TQQQ drops {tier1}%/{tier2}%/{tier3}%/{tier4}% below {ema_period}-day EMA | "
-    f"Transfer {transfer_pct}% of QQQ per tier"
+    f"Weekly ${weekly_dca} DCA → QQQ | "
+    f"Entry into TQQQ at {tier1}%/{tier2}%/{tier3}%/{tier4}% ({entry_transfer_pct}% per tier) | "
+    f"Exit TQQQ → QQQ at +{exit_threshold}% above EMA"
 )
 
 if run_button:
-    drawdown_tiers = sorted([tier1, tier2, tier3, tier4])
+    entry_tiers = sorted([tier1, tier2, tier3, tier4])
 
-    with st.spinner("📡 Fetching market data from Yahoo Finance..."):
+    with st.spinner("📡 Fetching market data..."):
         data = fetch_data(
             "QQQ", "TQQQ",
             start_date.strftime("%Y-%m-%d"),
@@ -326,78 +372,96 @@ if run_button:
         )
 
     if data.empty:
-        st.error("❌ No data found. Check your date range (TQQQ starts Feb 2010).")
+        st.error("❌ No data found. TQQQ starts Feb 2010.")
     else:
-        with st.spinner("⚙️ Running backtest simulation..."):
+        with st.spinner("⚙️ Running two-way rotation simulation..."):
             results = run_backtest(
                 data=data,
                 ema_period=ema_period,
                 weekly_dca=weekly_dca,
-                drawdown_tiers=drawdown_tiers,
-                transfer_pct=transfer_pct,
+                entry_tiers=entry_tiers,
+                entry_transfer_pct=entry_transfer_pct,
+                exit_threshold=exit_threshold,
                 reset_threshold=reset_threshold,
             )
 
         if results.empty:
-            st.error("❌ No results. EMA period may be too long for the date range.")
+            st.error("❌ No results produced.")
         else:
             metrics = compute_metrics(results)
 
-            # ===================== METRICS PANEL =====================
+            # ===================== METRICS =====================
             st.markdown("---")
             st.subheader("📊 Performance Summary")
 
             col1, col2, col3 = st.columns(3)
-            col1.metric("Total Invested", f"${metrics['total_invested']:,.0f}", f"{metrics['dca_weeks']} weeks")
-            col2.metric("Strategy Final Value", f"${metrics['final_strategy']:,.0f}",
+            col1.metric("Total Invested", f"${metrics['total_invested']:,.0f}")
+            col2.metric("Strategy Final", f"${metrics['final_strategy']:,.0f}",
                         f"+{metrics['roi_strategy']:.1f}% ROI")
-            col3.metric("Benchmark Final (QQQ DCA)", f"${metrics['final_benchmark']:,.0f}",
+            col3.metric("Benchmark (QQQ DCA)", f"${metrics['final_benchmark']:,.0f}",
                         f"+{metrics['roi_benchmark']:.1f}% ROI")
 
             col4, col5, col6 = st.columns(3)
-            col4.metric("Strategy vs Benchmark", f"+${metrics['alpha']:,.0f}",
-                        "outperformance" if metrics['alpha'] > 0 else "underperformance")
-            col5.metric("Strategy Max Drawdown", f"{metrics['mdd_strategy']:.2f}%")
-            col6.metric("Benchmark Max Drawdown", f"{metrics['mdd_benchmark']:.2f}%")
+            alpha_color = "normal" if metrics['alpha'] >= 0 else "inverse"
+            col4.metric("Alpha vs Benchmark",
+                        f"${metrics['alpha']:+,.0f}",
+                        f"{metrics['alpha_pct']:+.1f}%",
+                        delta_color=alpha_color)
+            col5.metric("Strategy MDD", f"{metrics['mdd_strategy']:.1f}%")
+            col6.metric("Benchmark MDD", f"{metrics['mdd_benchmark']:.1f}%")
 
-            col7, col8, col9 = st.columns(3)
-            col7.metric("Duration", f"{metrics['years']:.1f} years")
-            col8.metric("Tier Switches", f"{metrics['switches']}")
-            col9.metric("Reset Events", f"{metrics['resets']}")
+            col7, col8, col9, col10 = st.columns(4)
+            col7.metric("Duration", f"{metrics['years']:.1f} yrs")
+            col8.metric("Entry Switches", f"{metrics['entries']}")
+            col9.metric("Profit Exits", f"{metrics['exits']}")
+            col10.metric("Resets", f"{metrics['resets']}")
 
             # ===================== PORTFOLIO CHART =====================
             st.markdown("---")
-            st.subheader("📈 Portfolio Growth: Strategy vs Benchmark vs Invested")
+            st.subheader("📈 Portfolio Growth")
 
             chart_df = results[["Date", "Portfolio Value ($)", "Benchmark (QQQ DCA)", "Total Invested ($)"]].copy()
             chart_df["Date"] = pd.to_datetime(chart_df["Date"])
             chart_df = chart_df.set_index("Date")
             st.line_chart(chart_df, use_container_width=True)
 
-            # ===================== EMA DISTANCE CHART =====================
-            st.subheader("📉 TQQQ EMA Distance % (Tier Trigger Zones)")
+            # ===================== EMA DISTANCE =====================
+            st.subheader("📉 TQQQ EMA Distance % — Entry & Exit Zones")
+            st.caption(
+                f"🟢 Entry tiers: {tier1}%, {tier2}%, {tier3}%, {tier4}% | "
+                f"🔴 Exit threshold: +{exit_threshold}% | "
+                f"⚪ Reset: {reset_threshold}%"
+            )
 
             ema_chart = results[["Date", "EMA Dist %"]].copy()
             ema_chart["Date"] = pd.to_datetime(ema_chart["Date"])
             ema_chart = ema_chart.set_index("Date")
-
-            # Add tier lines info
-            st.caption(f"Tier triggers at: {tier1}%, {tier2}%, {tier3}%, {tier4}% | Reset at: {reset_threshold}%")
             st.area_chart(ema_chart, use_container_width=True)
 
-            # ===================== ALLOCATION CHART =====================
-            st.subheader("🏦 Asset Allocation Over Time")
+            # ===================== ALLOCATION =====================
+            st.subheader("🏦 Asset Allocation")
 
             alloc_chart = results[["Date", "QQQ Value ($)", "TQQQ Value ($)"]].copy()
             alloc_chart["Date"] = pd.to_datetime(alloc_chart["Date"])
             alloc_chart = alloc_chart.set_index("Date")
             st.area_chart(alloc_chart, use_container_width=True)
 
-            # ===================== EVENT LOG =====================
-            st.subheader("📋 Switching Events")
-            events = results[results["Action"].isin(["RESET"]) | results["Action"].str.contains("TIER")]
+            # ===================== ALLOCATION % =====================
+            st.subheader("📊 Allocation % Over Time")
+            alloc_pct = results[["Date", "QQQ Alloc %", "TQQQ Alloc %"]].copy()
+            alloc_pct["Date"] = pd.to_datetime(alloc_pct["Date"])
+            alloc_pct = alloc_pct.set_index("Date")
+            st.area_chart(alloc_pct, use_container_width=True)
+
+            # ===================== EVENTS =====================
+            st.subheader("📋 Rotation Events")
+            events = results[
+                results["Action"].str.contains("ENTRY") |
+                results["Action"].str.contains("EXIT") |
+                results["Action"].str.contains("RESET")
+            ]
             events_display = events[["Date", "Action", "EMA Dist %", "Transfer ($)",
-                                     "Portfolio Value ($)", "QQQ Shares", "TQQQ Shares", "Tiers Active"]]
+                                     "Portfolio Value ($)", "QQQ Alloc %", "TQQQ Alloc %", "Tiers Active"]]
             st.dataframe(events_display, use_container_width=True, height=300)
 
             # ===================== CSV DOWNLOAD =====================
@@ -418,28 +482,26 @@ if run_button:
                 st.dataframe(results.head(100), use_container_width=True)
 
 else:
-    # Landing page when no backtest has been run
-    st.info("👈 Configure parameters in the sidebar and click **Run Backtest**")
+    st.info("👈 Set your entry tiers, exit threshold, and DCA amount in the sidebar, then click **Run Backtest**")
 
     st.markdown("""
-    ### How This Strategy Works
+    ### 🔄 How Two-Way Rotation Works
 
-    | Step | Rule |
-    |------|------|
-    | **1. Weekly DCA** | Every week, deposit a fixed amount (e.g., $200) and buy QQQ shares |
-    | **2. Signal** | Calculate TQQQ's % distance below its 200-day EMA daily |
-    | **3. Tier Switches** | When TQQQ drops -20%, -30%, -40%, -50% below EMA → transfer 25% of QQQ to TQQQ at each level |
-    | **4. Reset** | When TQQQ recovers above EMA → reset all tier flags for next cycle |
-    | **5. Accumulation** | During drawdowns you accumulate discounted TQQQ; during recoveries you benefit from 3x leverage |
+    | Direction | Trigger | Action |
+    |-----------|---------|--------|
+    | **⬇️ ENTRY** | TQQQ drops -20%, -30%, -40%, -50% below EMA | Transfer 25% of QQQ → TQQQ at each tier |
+    | **⬆️ EXIT** | TQQQ surges +40% above EMA | Sell ALL TQQQ → rotate back to QQQ |
+    | **🔁 RESET** | TQQQ recovers above EMA (>0%) | Entry tier flags clear for next cycle |
+    | **💰 DCA** | Every week | Deposit $200 → buy QQQ |
 
-    ### Key Differences from Lump-Sum
-    - **No initial lump sum** — capital builds gradually through weekly DCA
-    - **Signal on TQQQ** — EMA distance measured on the leveraged asset (more volatile = earlier triggers)
-    - **Transfers from QQQ** — only move existing QQQ holdings into TQQQ (no new cash)
+    ### Why Two-Way?
+    - **Entry tiers** accumulate discounted TQQQ during crashes (3x leverage at low prices)
+    - **Exit threshold** locks in profits when TQQQ becomes overextended (prevents round-trip losses)
+    - **Result**: Capture leveraged upside during recoveries, book profits at peaks, repeat
 
     ### Quick Start
     1. Leave defaults or adjust sliders
     2. Click **🚀 Run Backtest**
-    3. Compare Strategy vs pure QQQ DCA benchmark
-    4. Download CSV for detailed analysis
+    3. Compare Strategy vs pure QQQ DCA
+    4. Experiment with different exit thresholds (+30% vs +50% vs +80%)
     """)
