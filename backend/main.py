@@ -660,3 +660,147 @@ def get_ticker_suggestions():
             "NVDA", "TSLA", "AAPL", "MSFT", "AMZN",
         ]
     }
+
+
+
+# ===========================================================================
+# QQQ/TQQQ SWITCHING STRATEGY BACKTEST
+# ===========================================================================
+class SwitchingRequest(BaseModel):
+    base_asset: str = Field(default="QQQ")
+    leveraged_asset: str = Field(default="TQQQ")
+    start_date: str = Field(default="2010-02-12")
+    end_date: str = Field(default="")
+    initial_capital: float = Field(default=100000.0, ge=1000)
+    ema_period: int = Field(default=200, ge=5)
+    drawdown_tiers: List[float] = Field(default=[-20.0, -30.0, -40.0, -50.0])
+    transfer_pct_per_tier: float = Field(default=25.0, ge=1.0, le=100.0)
+    reset_threshold: float = Field(default=0.0)
+
+
+@app.post("/switching-backtest")
+def switching_backtest(req: SwitchingRequest):
+    """Run QQQ/TQQQ EMA-distance switching backtest."""
+    try:
+        end_date = req.end_date if req.end_date else date.today().isoformat()
+
+        # Fetch both assets
+        base_df = fetch_price_data(req.base_asset, req.start_date, end_date)
+        lev_df = fetch_price_data(req.leveraged_asset, req.start_date, end_date)
+
+        # Align on common dates
+        combined = pd.DataFrame({
+            "base_close": base_df["Close"],
+            "lev_close": lev_df["Close"],
+        }).dropna()
+
+        if combined.empty:
+            raise HTTPException(status_code=400, detail="No overlapping data for the two assets")
+
+        # Compute EMA
+        combined["ema"] = combined["base_close"].ewm(span=req.ema_period, adjust=False).mean()
+        combined["ema_dist_pct"] = ((combined["base_close"] - combined["ema"]) / combined["ema"]) * 100.0
+        combined = combined.dropna()
+
+        # Simulation
+        first_price = float(combined["base_close"].iloc[0])
+        qqq_shares = req.initial_capital / first_price
+        tqqq_shares = 0.0
+        n_tiers = len(req.drawdown_tiers)
+        tiers_triggered = [False] * n_tiers
+
+        rows = []
+        for dt, row in combined.iterrows():
+            bp = float(row["base_close"])
+            lp = float(row["lev_close"])
+            ema_val = float(row["ema"])
+            dist = float(row["ema_dist_pct"])
+
+            action = "HOLD"
+            transfer = 0.0
+
+            # Reset when above EMA
+            if dist > req.reset_threshold:
+                if any(tiers_triggered):
+                    action = "RESET"
+                tiers_triggered = [False] * n_tiers
+            else:
+                # Check tiers
+                for t_idx, thresh in enumerate(req.drawdown_tiers):
+                    if dist <= thresh and not tiers_triggered[t_idx] and qqq_shares > 0:
+                        tiers_triggered[t_idx] = True
+                        sell_shares = qqq_shares * (req.transfer_pct_per_tier / 100.0)
+                        cash = sell_shares * bp
+                        tqqq_shares += cash / lp
+                        qqq_shares -= sell_shares
+                        transfer = cash
+                        action = f"TIER {t_idx+1} ({thresh:.0f}%)"
+                        break
+
+            total = (qqq_shares * bp) + (tqqq_shares * lp)
+            benchmark = (req.initial_capital / first_price) * bp
+
+            rows.append({
+                "date": dt.strftime("%Y-%m-%d"),
+                "base_price": round(bp, 4),
+                "lev_price": round(lp, 4),
+                "ema": round(ema_val, 4),
+                "ema_dist_pct": round(dist, 4),
+                "base_shares": round(qqq_shares, 4),
+                "lev_shares": round(tqqq_shares, 4),
+                "base_value": round(qqq_shares * bp, 2),
+                "lev_value": round(tqqq_shares * lp, 2),
+                "total_portfolio": round(total, 2),
+                "benchmark": round(benchmark, 2),
+                "tiers_active": sum(tiers_triggered),
+                "action": action,
+                "transfer": round(transfer, 2),
+            })
+
+        # Metrics
+        vals = np.array([r["total_portfolio"] for r in rows], dtype=np.float64)
+        bench = np.array([r["benchmark"] for r in rows], dtype=np.float64)
+        years = max((pd.to_datetime(rows[-1]["date"]) - pd.to_datetime(rows[0]["date"])).days / 365.25, 0.01)
+
+        warmup = min(252, len(vals) // 4)
+        mdd_v = vals[warmup:]
+        pk = np.maximum.accumulate(mdd_v)
+        mdd = float(((mdd_v - pk) / pk).min()) * 100 if len(mdd_v) > 0 else 0
+
+        mdd_b = bench[warmup:]
+        pk_b = np.maximum.accumulate(mdd_b)
+        mdd_bench = float(((mdd_b - pk_b) / pk_b).min()) * 100 if len(mdd_b) > 0 else 0
+
+        strategy_metrics = {
+            "terminal_value": round(vals[-1], 2),
+            "total_return": round((vals[-1] / req.initial_capital - 1) * 100, 2),
+            "cagr": round(((vals[-1] / req.initial_capital) ** (1 / years) - 1) * 100, 2),
+            "mdd": round(mdd, 2),
+            "years": round(years, 2),
+        }
+        benchmark_metrics = {
+            "terminal_value": round(bench[-1], 2),
+            "total_return": round((bench[-1] / req.initial_capital - 1) * 100, 2),
+            "cagr": round(((bench[-1] / req.initial_capital) ** (1 / years) - 1) * 100, 2),
+            "mdd": round(mdd_bench, 2),
+            "years": round(years, 2),
+        }
+
+        return {
+            "rows": rows,
+            "strategy_metrics": strategy_metrics,
+            "benchmark_metrics": benchmark_metrics,
+            "config": {
+                "base_asset": req.base_asset,
+                "leveraged_asset": req.leveraged_asset,
+                "tiers": req.drawdown_tiers,
+                "transfer_pct": req.transfer_pct_per_tier,
+            },
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[ERROR] Switching backtest failed: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Switching backtest error: {str(e)}")

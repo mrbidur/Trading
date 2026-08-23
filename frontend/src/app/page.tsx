@@ -80,6 +80,7 @@ export default function HomePage() {
               </h1>
               <p className="text-xs text-muted-foreground">
                 State-machine allocation strategy &middot; Leveraged ETF backtesting with configurable parameters
+                &nbsp;|&nbsp; <a href="/switching" className="text-primary hover:underline">QQQ/TQQQ Switching Strategy →</a>
               </p>
             </div>
           </div>
