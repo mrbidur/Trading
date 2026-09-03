@@ -123,7 +123,8 @@ def run_backtest(
     exit_tiers: List[Tuple[float, float, float]], # (threshold_pct, sell_weight_pct, reset_drop_to_pct)
     marginal_rate: float,                         # marginal tax rate %
     lt_discount_pct: float,                       # long-term (>365d) CGT discount %
-    cash_hold_weeks: int,                         # weeks to hold booked cash before buying QQQ
+    cash_hold_weeks: int,                         # MAX weeks to hold booked cash before buying QQQ (fallback)
+    pullback_pct: float,                          # TQQQ %-drop from booking price that triggers early redeploy (0 = off)
     fee_flat: float,                              # flat $ fee per trade
     fee_pct: float,                               # % commission of trade notional
 ) -> pd.DataFrame:
@@ -136,8 +137,15 @@ def run_backtest(
       a new TQQQ lot. Fires once per cycle; resets when dist > entry_reset_threshold.
 
     EXIT (up tiers): sell weight% of TQQQ shares into CASH. Realized gain taxed on
-      a FIFO lot basis (long-term >365d discounted). Net proceeds tagged to deploy
-      into QQQ after cash_hold_weeks. Each tier resets when dist < its reset level.
+      a FIFO lot basis (long-term >365d discounted). Net proceeds are parked in cash
+      and tracked as a bucket tagged with (booking_bar, booking_tqqq_price, amount).
+      Each tier resets when dist < its reset level.
+
+    HYBRID CASH → QQQ RE-DEPLOYMENT (whichever fires FIRST per bucket):
+      a) PRICE PULLBACK: if TQQQ falls >= pullback_pct below its price at the moment
+         the cash was booked, redeploy that bucket into QQQ immediately.
+      b) TIME FALLBACK: else, once the bucket has aged >= cash_hold_weeks, redeploy
+         it into QQQ.
 
     CASH is flat (no yield). Fees (flat + %) on every buy/sell/shift.
     """
@@ -215,10 +223,20 @@ def run_backtest(
             bench_shares += b_sh
             action = "DCA"
 
-        # --- DELAYED QQQ RE-DEPLOYMENT: release aged cash into QQQ ---
+        # --- HYBRID CASH → QQQ RE-DEPLOYMENT (pullback OR time, whichever first) ---
         deployed_to_qqq = 0.0
-        while pending_qqq and (bar_index - pending_qqq[0][0]) >= hold_bars:
-            _, amount = pending_qqq.popleft()
+        pullback_fired = False
+        time_fired = False
+        still_pending = deque()
+        while pending_qqq:
+            book_bar, book_tp, amount = pending_qqq.popleft()
+            aged = (bar_index - book_bar) >= hold_bars
+            # pullback measured vs TQQQ price at the moment this cash was booked
+            pulled_back = (pullback_pct > 0) and (book_tp > 0) and \
+                          (((book_tp - tp) / book_tp) * 100.0 >= pullback_pct)
+            if not (aged or pulled_back):
+                still_pending.append((book_bar, book_tp, amount))
+                continue
             amount = min(amount, cash)
             if amount <= 0:
                 continue
@@ -229,8 +247,19 @@ def run_backtest(
                 total_fees += fee
                 fee_today += fee
                 deployed_to_qqq += notional
+                if pulled_back:
+                    pullback_fired = True
+                else:
+                    time_fired = True
+        pending_qqq = still_pending
         if deployed_to_qqq > 0:
-            lbl = f"CASH→QQQ deploy (${deployed_to_qqq:,.0f})"
+            if pullback_fired and time_fired:
+                trig = "pullback+time"
+            elif pullback_fired:
+                trig = f"pullback ≥{pullback_pct:.0f}%"
+            else:
+                trig = "time limit"
+            lbl = f"CASH→QQQ deploy ${deployed_to_qqq:,.0f} [{trig}]"
             action = lbl if action == "HOLD" else f"{action} + {lbl}"
             transfer += deployed_to_qqq
 
@@ -265,7 +294,8 @@ def run_backtest(
                     tax_today += tax
                     transfer += gross
                     if net_to_cash > 0:
-                        pending_qqq.append((bar_index, max(net_to_cash, 0.0)))
+                        # (booking_bar, TQQQ price at booking, amount) for hybrid redeploy
+                        pending_qqq.append((bar_index, tp, max(net_to_cash, 0.0)))
                     tier_label = (f"EXIT→CASH T{e_idx+1} (+{threshold:.0f}%, {weight:.0f}%, "
                                   f"gain ${gain:,.0f}, tax ${tax:,.0f})")
                     action = tier_label if action == "HOLD" else f"{action} + {tier_label}"
@@ -340,7 +370,7 @@ def run_backtest(
         cash_pct = (cash / total * 100) if total > 0 else 100
         tqqq_pct = (tqqq_val / total * 100) if total > 0 else 0
         qqq_pct = (qqq_val / total * 100) if total > 0 else 0
-        pending_cash = sum(a for _, a in pending_qqq)
+        pending_cash = sum(a for _, _, a in pending_qqq)
 
         rows.append({
             "Date": dt.strftime("%Y-%m-%d"),
@@ -406,6 +436,8 @@ def compute_metrics(df: pd.DataFrame) -> dict:
     exits = df["Action"].str.contains("EXIT").sum()
     resets = df["Action"].str.contains("RESET").sum()
     qqq_deploys = df["Action"].str.contains("CASH→QQQ").sum()
+    pullback_deploys = df["Action"].str.contains(r"pullback").sum()
+    time_deploys = df["Action"].str.contains(r"time limit").sum()
 
     total_fees = df["Cumulative Fees ($)"].values[-1] if "Cumulative Fees ($)" in df.columns else 0.0
     total_tax = df["Cumulative Tax ($)"].values[-1] if "Cumulative Tax ($)" in df.columns else 0.0
@@ -419,6 +451,7 @@ def compute_metrics(df: pd.DataFrame) -> dict:
         mdd_s=mdd(v), mdd_b=mdd(b), years=yrs,
         alpha=final_s - final_b, alpha_pct=(final_s/final_b-1)*100 if final_b>0 else 0,
         entries=entries, exits=exits, resets=resets, qqq_deploys=qqq_deploys,
+        pullback_deploys=pullback_deploys, time_deploys=time_deploys,
         total_fees=total_fees, total_tax=total_tax, n_trades=n_trades,
         fee_drag_pct=fee_drag_pct, tax_drag_pct=tax_drag_pct,
     )
@@ -486,10 +519,12 @@ for i in range(int(n_exit_tiers)):
 
 # --- POST-EXIT CASH HOLDING BEFORE QQQ ---
 st.sidebar.markdown("---")
-st.sidebar.markdown("## 🏦 Post-Exit Cash → QQQ")
-st.sidebar.caption("After booking TQQQ profits to cash, hold the cash this many weeks, then buy QQQ.")
-cash_hold_weeks = st.sidebar.slider("Cash Hold Before QQQ (weeks)", 0, 104, 4, 1,
-    help="0 = deploy into QQQ on the next bar; larger = longer sideline pause")
+st.sidebar.markdown("## 🏦 Post-Exit Cash → QQQ (Hybrid)")
+st.sidebar.caption("Booked cash redeploys into QQQ on whichever fires FIRST: a TQQQ pullback OR the max hold time.")
+pullback_pct = st.sidebar.slider("Pullback % Trigger for Cash Re-deployment", 0, 80, 20, 5,
+    help="If TQQQ drops this % below its price when the cash was booked, redeploy into QQQ immediately. 0 = disable pullback trigger (time-only).")
+cash_hold_weeks = st.sidebar.slider("Max Cash Hold Before QQQ (weeks)", 0, 104, 12, 1,
+    help="Time fallback: if the pullback trigger isn't hit, redeploy into QQQ once this many weeks elapse. 0 = deploy next bar.")
 
 st.sidebar.markdown("---")
 run = st.sidebar.button("🚀 Run Backtest", use_container_width=True, type="primary")
@@ -505,7 +540,7 @@ exit_str = " | ".join([f"+{t:.0f}%→cash {w:.0f}%(reset@{r:.0f}%)" for t, w, r 
 fee_str = f"{fee_pct:.2f}% + ${fee_flat:.2f}/trade"
 st.caption(
     f"DCA ${weekly_dca}/wk → CASH (flat) | Fees: {fee_str} | Tax: {marginal_rate:.0f}% "
-    f"(LT >365d −{lt_discount_pct:.0f}%) | Cash→QQQ after {cash_hold_weeks} wk | "
+    f"(LT >365d −{lt_discount_pct:.0f}%) | Cash→QQQ: pullback ≥{pullback_pct}% OR ≤{cash_hold_weeks}wk | "
     f"Entry: [{entry_str}] | Exit→Cash: [{exit_str}]"
 )
 
@@ -520,7 +555,7 @@ if run:
             results = run_backtest(
                 data, ema_period, weekly_dca,
                 entry_tiers, entry_reset, exit_tiers,
-                marginal_rate, lt_discount_pct, cash_hold_weeks,
+                marginal_rate, lt_discount_pct, cash_hold_weeks, pullback_pct,
                 fee_flat, fee_pct,
             )
 
@@ -554,6 +589,11 @@ if run:
             r4[1].metric("Exit→Cash", m['exits'])
             r4[2].metric("Cash→QQQ Deploys", m['qqq_deploys'])
             r4[3].metric("Resets", m['resets'])
+            r5 = st.columns(4)
+            r5[0].metric("↳ via Pullback", m['pullback_deploys'],
+                         help="Redeployments triggered early by the TQQQ pullback condition")
+            r5[1].metric("↳ via Time Limit", m['time_deploys'],
+                         help="Redeployments triggered by the max-hold-weeks fallback")
 
             st.markdown("---")
             st.subheader("📈 Portfolio Growth")
@@ -616,15 +656,20 @@ else:
     | 💰 DCA | Weekly | Add cash | fee on benchmark buy |
     | ⬇️ ENTRY | TQQQ below EMA tiers | Shift **% of total portfolio** → TQQQ (cash first, then sell QQQ) | commission + tax on any QQQ sold |
     | ⬆️ EXIT | TQQQ above EMA tiers | Book **% of TQQQ** → CASH | **FIFO capital-gains tax** + commission |
-    | 🏦 REDEPLOY | Cash held N weeks | Booked cash → QQQ | commission |
+    | 🏦 REDEPLOY | **Pullback OR time** (first) | Booked cash → QQQ | commission |
 
     ### Key mechanics in this version
     - **Portfolio-wide entry sizing**: each entry tier shifts a % of your *total
       portfolio value* into TQQQ, funded from **cash first, then by liquidating QQQ**.
     - **FIFO tax lots**: gains are realized oldest-lot-first. Lots held **> 365 days**
       get a configurable **long-term discount** (default 50%) before your marginal rate.
-    - **No exit time-delay** — exits fire the moment a tier is hit. The only waiting
-      period is the **post-exit cash hold (in weeks)** before that cash buys QQQ.
+    - **No exit time-delay** — exits fire the moment a tier is hit.
+    - **Hybrid cash → QQQ re-deployment**: after profits are booked to cash, each
+      bucket redeploys into QQQ on **whichever happens first**:
+        - **Price pullback** — TQQQ drops ≥ your pullback % below its price when the
+          cash was booked (buy the new dip early), or
+        - **Time limit** — the max hold weeks elapse (fallback).
+      The metrics and trade log show which trigger fired for each redeployment.
     - **Flat cash** (no yield) and **fees** (flat + %) on every transaction.
     - All metrics are reported **net of taxes and fees**.
     """)
