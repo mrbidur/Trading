@@ -72,6 +72,9 @@ def run_backtest(
     exit_tiers: List[Tuple[float, float, float]], # (threshold_pct, sell_weight_pct, reset_drop_to_pct)
     hold_delay_days: int,
     cash_apy: float,
+    fee_flat: float,        # flat $ fee per trade
+    fee_pct: float,         # % commission of trade notional
+    fee_per_share: float,   # $ per share fee
 ) -> pd.DataFrame:
     """
     Three-state rotation: CASH ↔ TQQQ (profit-booking goes to CASH).
@@ -104,10 +107,17 @@ def run_backtest(
     if data.empty:
         return pd.DataFrame()
 
+    def trade_cost(notional: float, shares: float) -> float:
+        """Total brokerage cost for a trade of given $ notional and share count."""
+        if notional <= 0 and shares <= 0:
+            return 0.0
+        return fee_flat + (notional * fee_pct / 100.0) + (abs(shares) * fee_per_share)
+
     # State — starts fully in CASH
     cash = 0.0
     tqqq_shares = 0.0
     total_invested = 0.0
+    total_fees = 0.0
     last_dca_week = None
 
     n_entry = len(entry_tiers)
@@ -139,6 +149,7 @@ def run_backtest(
         action = "HOLD"
         deposit = 0.0
         transfer = 0.0
+        fee_today = 0.0
 
         # --- Cash yield (compounds daily) ---
         if cash > 0 and cash_apy > 0:
@@ -156,7 +167,10 @@ def run_backtest(
             deposit = weekly_dca
             cash += deposit
             total_invested += deposit
-            bench_shares += deposit / qp  # benchmark buys QQQ
+            # Benchmark buys QQQ every week, net of the same trade friction
+            bench_shares_bought = deposit / qp
+            bench_fee = trade_cost(deposit, bench_shares_bought)
+            bench_shares += max(deposit - bench_fee, 0.0) / qp
             action = "DCA"
 
         # --- ENTRY RESET ---
@@ -180,8 +194,12 @@ def run_backtest(
                     exit_triggered[e_idx] = True
                     shares_to_sell = tqqq_shares * (weight / 100.0)
                     proceeds = shares_to_sell * tp
-                    cash += proceeds          # PROFIT BOOKED TO CASH
+                    fee = trade_cost(proceeds, shares_to_sell)   # brokerage on the sell
+                    net_proceeds = max(proceeds - fee, 0.0)
+                    cash += net_proceeds      # NET PROFIT BOOKED TO CASH (after fees)
                     tqqq_shares -= shares_to_sell
+                    total_fees += fee
+                    fee_today += fee
                     transfer = proceeds
                     tier_label = f"EXIT→CASH T{e_idx+1} (+{threshold:.0f}%, {weight:.0f}%)"
                     action = tier_label if action == "HOLD" else f"{action} + {tier_label}"
@@ -194,8 +212,17 @@ def run_backtest(
                     entry_triggered[t_idx] = True
                     was_flat = (tqqq_shares == 0)
                     deploy_cash = cash * (weight / 100.0)
-                    tqqq_shares += deploy_cash / tp
-                    cash -= deploy_cash        # CASH DEPLOYED INTO TQQQ
+                    # Fee comes out of the deployed cash; only the net actually buys shares.
+                    # Solve for shares s.t. gross = shares*tp, fee = flat + gross*pct + shares*per_share,
+                    # and gross + fee = deploy_cash.
+                    denom = tp * (1.0 + fee_pct / 100.0) + fee_per_share
+                    shares_bought = max((deploy_cash - fee_flat), 0.0) / denom if denom > 0 else 0.0
+                    gross = shares_bought * tp
+                    fee = trade_cost(gross, shares_bought)
+                    tqqq_shares += shares_bought
+                    cash -= (gross + fee)      # CASH DEPLOYED INTO TQQQ (net of fees)
+                    total_fees += fee
+                    fee_today += fee
                     transfer = deploy_cash
                     if was_flat:
                         days_since_entry = 0
@@ -230,6 +257,8 @@ def run_backtest(
             "Action": action,
             "Deposit ($)": round(deposit, 2),
             "Transfer ($)": round(transfer, 2),
+            "Fee ($)": round(fee_today, 4),
+            "Cumulative Fees ($)": round(total_fees, 2),
         })
 
     return pd.DataFrame(rows)
@@ -263,12 +292,17 @@ def compute_metrics(df: pd.DataFrame) -> dict:
     exits = df["Action"].str.contains("EXIT").sum()
     resets = df["Action"].str.contains("RESET").sum()
 
+    total_fees = df["Cumulative Fees ($)"].values[-1] if "Cumulative Fees ($)" in df.columns else 0.0
+    n_trades = int((df["Fee ($)"] > 0).sum()) if "Fee ($)" in df.columns else 0
+    fee_drag_pct = (total_fees / inv * 100) if inv > 0 else 0.0
+
     return dict(
         invested=inv, final_s=final_s, final_b=final_b,
         roi_s=roi_s, roi_b=roi_b, cagr_s=cagr_s, cagr_b=cagr_b,
         mdd_s=mdd(v), mdd_b=mdd(b), years=yrs,
         alpha=final_s - final_b, alpha_pct=(final_s/final_b-1)*100 if final_b>0 else 0,
         entries=entries, exits=exits, resets=resets,
+        total_fees=total_fees, n_trades=n_trades, fee_drag_pct=fee_drag_pct,
     )
 
 
@@ -292,6 +326,17 @@ ema_period = st.sidebar.slider("EMA Period (days)", 10, 500, 200, 10)
 st.sidebar.markdown("## 🏦 Cash Yield")
 cash_apy = st.sidebar.slider("Cash APY (%)", 0.0, 8.0, 4.5, 0.5,
     help="Idle cash earns this yield (T-bill dry powder)")
+
+# --- TRANSACTION COSTS ---
+st.sidebar.markdown("---")
+st.sidebar.markdown("## 💸 Brokerage / Transaction Costs")
+st.sidebar.caption("Applied to every DCA buy, entry (Cash→TQQQ) and exit (TQQQ→Cash) trade")
+fee_pct = st.sidebar.slider("Commission (% of trade value)", 0.0, 1.0, 0.0, 0.01,
+    help="Percentage-based commission per trade, e.g. 0.05% or 0.1%")
+fee_flat = st.sidebar.number_input("Flat Fee per Trade ($)", 0.0, 100.0, 0.0, 0.5,
+    help="Fixed dollar fee charged on each trade")
+fee_per_share = st.sidebar.number_input("Per-Share Fee ($)", 0.0, 1.0, 0.0, 0.001,
+    format="%.3f", help="Fixed fee per share traded (e.g. $0.005/share)")
 
 # --- ENTRY ---
 st.sidebar.markdown("---")
@@ -338,9 +383,10 @@ st.title("💵 QQQ/TQQQ/CASH Phased Rotation (Profit-to-Cash)")
 
 entry_str = " | ".join([f"{t:.0f}%→{w:.0f}%" for t, w in entry_tiers])
 exit_str = " | ".join([f"+{t:.0f}%→cash {w:.0f}%(reset@{r:.0f}%)" for t, w, r in exit_tiers])
+fee_str = f"{fee_pct:.2f}% + ${fee_flat:.2f}/trade + ${fee_per_share:.3f}/sh"
 st.caption(
     f"DCA ${weekly_dca}/wk → CASH ({cash_apy}% APY) | Hold-delay: {delay_value} {delay_unit.lower()} | "
-    f"Entry: [{entry_str}] | Exit→Cash: [{exit_str}]"
+    f"Fees: {fee_str} | Entry: [{entry_str}] | Exit→Cash: [{exit_str}]"
 )
 
 if run:
@@ -354,6 +400,7 @@ if run:
             results = run_backtest(
                 data, ema_period, weekly_dca,
                 entry_tiers, entry_reset, exit_tiers, hold_delay_days, cash_apy,
+                fee_flat, fee_pct, fee_per_share,
             )
 
         if results.empty:
@@ -362,15 +409,15 @@ if run:
             m = compute_metrics(results)
 
             st.markdown("---")
-            st.subheader("📊 Performance")
+            st.subheader("📊 Performance (Net of Fees)")
             r1 = st.columns(4)
             r1[0].metric("Invested", f"${m['invested']:,.0f}")
-            r1[1].metric("Strategy", f"${m['final_s']:,.0f}", f"+{m['roi_s']:.1f}%")
+            r1[1].metric("Strategy (Net)", f"${m['final_s']:,.0f}", f"+{m['roi_s']:.1f}%")
             r1[2].metric("Benchmark (QQQ DCA)", f"${m['final_b']:,.0f}", f"+{m['roi_b']:.1f}%")
             r1[3].metric("Alpha", f"${m['alpha']:+,.0f}", f"{m['alpha_pct']:+.1f}%",
                          delta_color="normal" if m['alpha'] >= 0 else "inverse")
             r2 = st.columns(4)
-            r2[0].metric("CAGR (Strategy)", f"{m['cagr_s']:.2f}%")
+            r2[0].metric("Net CAGR (Strategy)", f"{m['cagr_s']:.2f}%")
             r2[1].metric("CAGR (Benchmark)", f"{m['cagr_b']:.2f}%")
             r2[2].metric("MDD (Strategy)", f"{m['mdd_s']:.1f}%")
             r2[3].metric("MDD (Benchmark)", f"{m['mdd_b']:.1f}%")
@@ -379,6 +426,12 @@ if run:
             r3[1].metric("Entry Switches", m['entries'])
             r3[2].metric("Exit→Cash", m['exits'])
             r3[3].metric("Resets", m['resets'])
+            r4 = st.columns(4)
+            r4[0].metric("💸 Total Fees Paid", f"${m['total_fees']:,.2f}")
+            r4[1].metric("Trades Charged", f"{m['n_trades']:,}")
+            r4[2].metric("Fee Drag (% of invested)", f"{m['fee_drag_pct']:.2f}%")
+            avg_fee = (m['total_fees'] / m['n_trades']) if m['n_trades'] > 0 else 0.0
+            r4[3].metric("Avg Fee / Trade", f"${avg_fee:,.2f}")
 
             st.markdown("---")
             st.subheader("📈 Portfolio Growth")
@@ -405,7 +458,7 @@ if run:
             st.subheader("📋 Rotation Events")
             ev = results[results["Action"].str.contains("ENTRY|EXIT|RESET")]
             st.dataframe(
-                ev[["Date","Action","EMA Dist %","Days Held","Transfer ($)","Portfolio ($)","Cash %","TQQQ %"]],
+                ev[["Date","Action","EMA Dist %","Days Held","Transfer ($)","Fee ($)","Portfolio ($)","Cash %","TQQQ %"]],
                 use_container_width=True, height=300,
             )
 
@@ -440,6 +493,17 @@ else:
     - Cash earns a **configurable APY** while waiting for the next drawdown
     - Entries deploy **from cash** (buying the dip with accumulated dry powder)
     - This creates a cleaner "buy low, sell high, wait in cash" cycle
+
+    ### 💸 Realistic Transaction Costs
+    Every trade (DCA buy, Cash→TQQQ entry, TQQQ→Cash exit) is charged brokerage
+    friction that you configure in the sidebar:
+    - **Commission %** — e.g. 0.05% or 0.1% of the trade value
+    - **Flat fee** — a fixed dollar charge per trade
+    - **Per-share fee** — e.g. $0.005 per share
+
+    Fees are deducted from the cash balance / trade proceeds so all returns
+    reported are **net of fees**. Total fees, trade count, and fee drag are shown
+    in the metrics, and per-transaction fees appear in the downloadable CSV.
 
     ### Example Cycle
     1. DCA accumulates cash weekly
