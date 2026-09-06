@@ -495,12 +495,15 @@ lt_discount_pct = st.sidebar.slider("Long-Term Discount (%) for >365d", 0.0, 100
 st.sidebar.markdown("---")
 st.sidebar.markdown("## 📉 ENTRY TIERS (→ TQQQ)")
 st.sidebar.caption("TQQQ drops X% below EMA → shift Y% of TOTAL PORTFOLIO into TQQQ (cash first, then sell QQQ)")
-n_entry_tiers = st.sidebar.number_input("Number of Entry Tiers", 1, 8, 4, 1)
+n_entry_tiers = st.sidebar.number_input("Number of Entry Tiers", 1, 8, 2, 1)
+# Spec defaults: Tier 1 = -40% → 40% of portfolio, Tier 2 = -50% → 60% (remainder)
+ENTRY_DEFAULT_TRIG = [-40, -50, -60, -30, -20, -25, -35, -45]
+ENTRY_DEFAULT_WT   = [40, 60, 100, 25, 25, 25, 25, 25]
 entry_tiers = []
 for i in range(int(n_entry_tiers)):
     c1, c2 = st.sidebar.columns(2)
-    thresh = c1.slider(f"E{i+1} Trigger %", -80, 0, -20 - i*10, 5, key=f"et_{i}")
-    weight = c2.slider(f"E{i+1} Portfolio %", 5, 100, 25, 5, key=f"ew_{i}")
+    thresh = c1.slider(f"E{i+1} Trigger %", -80, 0, ENTRY_DEFAULT_TRIG[i], 5, key=f"et_{i}")
+    weight = c2.slider(f"E{i+1} Portfolio %", 5, 100, ENTRY_DEFAULT_WT[i], 5, key=f"ew_{i}")
     entry_tiers.append((thresh, weight))
 entry_reset = st.sidebar.slider("Entry Reset Threshold (%)", -10, 20, 0, 1)
 
@@ -508,13 +511,17 @@ entry_reset = st.sidebar.slider("Entry Reset Threshold (%)", -10, 20, 0, 1)
 st.sidebar.markdown("---")
 st.sidebar.markdown("## 📈 EXIT TIERS (TQQQ → CASH, taxed)")
 st.sidebar.caption("TQQQ surges X% above EMA → book Y% of TQQQ to CASH. Resets when dist < Z%.")
-n_exit_tiers = st.sidebar.number_input("Number of Exit Tiers", 1, 8, 3, 1)
+n_exit_tiers = st.sidebar.number_input("Number of Exit Tiers", 1, 8, 1, 1)
+# Spec default: single exit at +50% → book 100% to cash (resets when dist < +30%)
+EXIT_DEFAULT_TRIG  = [50, 65, 80, 95, 110, 125, 140, 150]
+EXIT_DEFAULT_WT    = [100, 100, 100, 100, 100, 100, 100, 100]
+EXIT_DEFAULT_RESET = [30, 45, 60, 75, 90, 105, 120, 135]
 exit_tiers = []
 for i in range(int(n_exit_tiers)):
     c1, c2, c3 = st.sidebar.columns(3)
-    thresh = c1.slider(f"X{i+1} Trigger", 10, 150, 30 + i*15, 5, key=f"xt_{i}")
-    weight = c2.slider(f"X{i+1} to Cash %", 5, 100, 50 if i == 0 else 100, 5, key=f"xw_{i}")
-    reset_at = c3.slider(f"X{i+1} Reset", -10, 100, max(0, 30 + i*15 - 10), 5, key=f"xr_{i}")
+    thresh = c1.slider(f"X{i+1} Trigger", 10, 150, EXIT_DEFAULT_TRIG[i], 5, key=f"xt_{i}")
+    weight = c2.slider(f"X{i+1} to Cash %", 5, 100, EXIT_DEFAULT_WT[i], 5, key=f"xw_{i}")
+    reset_at = c3.slider(f"X{i+1} Reset", -10, 100, EXIT_DEFAULT_RESET[i], 5, key=f"xr_{i}")
     exit_tiers.append((thresh, weight, reset_at))
 
 # --- POST-EXIT CASH HOLDING BEFORE QQQ ---
@@ -657,6 +664,13 @@ else:
     | ⬇️ ENTRY | TQQQ below EMA tiers | Shift **% of total portfolio** → TQQQ (cash first, then sell QQQ) | commission + tax on any QQQ sold |
     | ⬆️ EXIT | TQQQ above EMA tiers | Book **% of TQQQ** → CASH | **FIFO capital-gains tax** + commission |
     | 🏦 REDEPLOY | **Pullback OR time** (first) | Booked cash → QQQ | commission |
+
+    ### 🎯 Preloaded default strategy (edit any value in the sidebar)
+    - **Entry Tier 1**: TQQQ −40% below EMA → shift **40%** of portfolio into TQQQ
+    - **Entry Tier 2**: TQQQ −50% below EMA → shift **60%** of portfolio into TQQQ
+    - **Exit**: TQQQ **+50%** above EMA → book **100%** of TQQQ to cash (FIFO-taxed)
+    - **Re-deploy to QQQ**: **20%** TQQQ pullback **OR** **12 weeks** — whichever first
+    - Entry tiers reset when TQQQ recovers above the 200 EMA
 
     ### Key mechanics in this version
     - **Portfolio-wide entry sizing**: each entry tier shifts a % of your *total
