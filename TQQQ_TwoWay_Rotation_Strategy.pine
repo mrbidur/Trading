@@ -1,0 +1,228 @@
+// This Pine Script™ source is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+
+//@version=5
+// =============================================================================
+// TQQQ Two-Way Rotation Strategy  (QQQ  <->  TQQQ  <->  CASH)
+// -----------------------------------------------------------------------------
+// Mirrors the Streamlit backtest engine (streamlit_switching_app.py):
+//   * Phased ENTRY tiers  : TQQQ drops X% below its 200 EMA -> deploy % of
+//                           portfolio into TQQQ (Tier1 -40%->40%, Tier2 -50%->60%)
+//   * Single EXIT trigger : TQQQ +50% above 200 EMA -> book 100% to CASH,
+//                           resets when distance drops back below +30%
+//   * HYBRID re-deploy     : after an exit, go back into a QQQ-equivalent long on
+//                           whichever fires first:
+//                              (a) TQQQ pulls back >= 20% from the exit price, OR
+//                              (b) a max hold time (12 weeks) elapses.
+//   * Entry tiers reset when TQQQ recovers back above the 200 EMA.
+//
+// HOW TO USE
+//   Add this strategy to a TQQQ chart (daily timeframe recommended, since the
+//   EMA and thresholds were designed around a 200-DAY EMA). Because Pine
+//   strategies trade a single symbol, the "TQQQ leg" is traded natively and the
+//   "QQQ baseline leg" is modelled as a de-leveraged long (position size scaled
+//   by qqq_beta) so TradingView's built-in backtest report stays meaningful.
+//   Commission & slippage should be set in the Strategy Properties tab OR via
+//   the inputs below.
+// =============================================================================
+strategy("TQQQ Two-Way Rotation (QQQ/TQQQ/CASH)",
+     overlay              = true,
+     initial_capital      = 10000,
+     default_qty_type     = strategy.percent_of_equity,
+     default_qty_value    = 100,
+     pyramiding           = 4,
+     commission_type      = strategy.commission.percent,
+     commission_value     = 0.0,
+     calc_on_every_tick   = false,
+     process_orders_on_close = true,
+     max_labels_count     = 500,
+     max_bars_back        = 5000)
+
+// =============================================================================
+// INPUTS
+// =============================================================================
+grp_ema = "Signal — 200 EMA Distance"
+ema_period   = input.int(200, "EMA Period (days)", group=grp_ema, minval=5,
+     tooltip="Distance is measured as (Close - EMA) / EMA * 100 on this chart's symbol (use on TQQQ).")
+
+grp_entry = "Entry Tiers  (drop below EMA -> buy TQQQ)"
+n_entry      = input.int(2, "Number of Entry Tiers", minval=1, maxval=4, group=grp_entry)
+e1_trig      = input.float(-40.0, "Tier 1 Trigger %", step=5.0, group=grp_entry)
+e1_wt        = input.float(40.0,  "Tier 1 Portfolio %", minval=1, maxval=100, step=5.0, group=grp_entry)
+e2_trig      = input.float(-50.0, "Tier 2 Trigger %", step=5.0, group=grp_entry)
+e2_wt        = input.float(60.0,  "Tier 2 Portfolio %", minval=1, maxval=100, step=5.0, group=grp_entry)
+e3_trig      = input.float(-60.0, "Tier 3 Trigger %", step=5.0, group=grp_entry)
+e3_wt        = input.float(100.0, "Tier 3 Portfolio %", minval=1, maxval=100, step=5.0, group=grp_entry)
+e4_trig      = input.float(-70.0, "Tier 4 Trigger %", step=5.0, group=grp_entry)
+e4_wt        = input.float(100.0, "Tier 4 Portfolio %", minval=1, maxval=100, step=5.0, group=grp_entry)
+entry_reset  = input.float(0.0,   "Entry Reset Threshold %", step=1.0, group=grp_entry,
+     tooltip="Entry tiers re-arm once TQQQ distance rises back above this level (recovery above EMA).")
+
+grp_exit = "Exit Trigger  (surge above EMA -> book to cash)"
+x_trig       = input.float(50.0, "Exit Trigger %", step=5.0, group=grp_exit)
+x_reset      = input.float(30.0, "Exit Reset %", step=5.0, group=grp_exit,
+     tooltip="Exit re-arms only after distance falls back below this level.")
+
+grp_redep = "Hybrid Cash -> QQQ Re-deployment"
+pullback_pct = input.float(20.0, "Pullback % Trigger", minval=0, step=5.0, group=grp_redep,
+     tooltip="After an exit, re-enter (QQQ leg) if TQQQ falls this % below the exit price. 0 = disable pullback path.")
+hold_weeks   = input.int(12, "Max Cash Hold (weeks)", minval=0, group=grp_redep,
+     tooltip="Time fallback: re-deploy into the QQQ leg after this many weeks if the pullback isn't hit.")
+qqq_beta     = input.float(0.333, "QQQ Leg Size vs TQQQ (beta)", minval=0.05, maxval=1.0, step=0.001, group=grp_redep,
+     tooltip="QQQ ~ 1/3 the daily move of TQQQ. The re-deployed 'QQQ baseline' long is sized by this factor for a realistic comparison on a TQQQ chart.")
+
+// NOTE ON COSTS: TradingView applies commission & slippage from the
+// "Properties" tab of the strategy (or the commission_value set in the
+// strategy() header above). Set them there to model brokerage friction —
+// Pine does not allow an input to drive commission_value dynamically.
+
+grp_dates = "Backtest Window"
+use_dates    = input.bool(false, "Limit Date Range", group=grp_dates)
+start_date   = input.time(timestamp("2010-02-11T00:00:00"), "Start", group=grp_dates)
+end_date     = input.time(timestamp("2100-01-01T00:00:00"), "End", group=grp_dates)
+in_window    = not use_dates or (time >= start_date and time <= end_date)
+
+// =============================================================================
+// SIGNAL — 200 EMA distance (on chart symbol, intended = TQQQ)
+// =============================================================================
+ema  = ta.ema(close, ema_period)
+dist = (close - ema) / ema * 100.0
+bars_per_week = 5              // ~5 trading days per week on a daily chart
+hold_bars     = hold_weeks * bars_per_week
+
+// =============================================================================
+// STATE MACHINE
+// Phase: 0 = QQQ baseline / accumulating,  1 = IN TQQQ,  2 = CASH (post-exit, waiting to re-deploy)
+// =============================================================================
+var int   phase          = 0
+var bool  e1_done        = false
+var bool  e2_done        = false
+var bool  e3_done        = false
+var bool  e4_done        = false
+var bool  exit_armed     = true      // exit can fire only when armed
+var float exit_price     = na        // TQQQ price at the moment of exit (for pullback ref)
+var int   exit_bar       = na        // bar_index at exit (for time fallback)
+var bool  in_tqqq        = false     // are we currently long the leveraged TQQQ leg?
+var bool  in_qqq         = false     // are we currently long the QQQ baseline leg?
+
+// --- Entry-tier reset: TQQQ recovered above EMA ---
+if dist > entry_reset
+    e1_done := false
+    e2_done := false
+    e3_done := false
+    e4_done := false
+
+// --- Exit re-arm: distance dropped back below the exit-reset level ---
+if not exit_armed and dist < x_reset
+    exit_armed := true
+
+// =============================================================================
+// EXIT:  TQQQ +X% above EMA  ->  book 100% to cash
+// =============================================================================
+exit_signal = in_tqqq and exit_armed and dist >= x_trig and in_window
+if exit_signal
+    strategy.close_all(comment="EXIT +" + str.tostring(x_trig, "#") + "% -> CASH")
+    in_tqqq    := false
+    phase      := 2                 // now sitting in CASH, tracking hybrid re-deploy
+    exit_armed := false
+    exit_price := close
+    exit_bar   := bar_index
+
+// =============================================================================
+// HYBRID CASH -> QQQ RE-DEPLOYMENT (whichever fires first)
+//   a) pullback: TQQQ fell >= pullback_pct below the exit price
+//   b) time    : hold_bars elapsed since the exit
+// =============================================================================
+pulled_back = pullback_pct > 0 and not na(exit_price) and ((exit_price - close) / exit_price * 100.0) >= pullback_pct
+timed_out   = not na(exit_bar) and (bar_index - exit_bar) >= hold_bars
+redeploy    = phase == 2 and (pulled_back or timed_out) and in_window
+if redeploy
+    // Establish the QQQ baseline leg, sized down by qqq_beta (QQQ ~ 1/3 TQQQ move)
+    qty_pct = 100.0 * qqq_beta
+    trig_txt = pulled_back ? "pullback>=" + str.tostring(pullback_pct, "#") + "%" : "time " + str.tostring(hold_weeks) + "w"
+    strategy.entry("QQQ", strategy.long, qty=qty_pct, comment="CASH->QQQ (" + trig_txt + ")")
+    in_qqq     := true
+    phase      := 0                 // back to baseline, ready to rotate into TQQQ on the next drawdown
+    exit_price := na
+    exit_bar   := na
+
+// =============================================================================
+// ENTRY TIERS:  TQQQ drops below EMA tiers  ->  rotate into TQQQ
+// Funded "portfolio-wide": we first exit the QQQ baseline leg, then open TQQQ.
+// Each tier adds to the TQQQ position (pyramiding) sized as % of equity.
+// =============================================================================
+enterTier(float trig, float wt, bool done) =>
+    dist <= trig and not done and dist <= entry_reset and in_window
+
+// Tier 1
+if n_entry >= 1 and enterTier(e1_trig, e1_wt, e1_done)
+    if in_qqq
+        strategy.close("QQQ", comment="QQQ->TQQQ rotate")
+        in_qqq := false
+    strategy.entry("TQQQ", strategy.long, qty=e1_wt, comment="ENTRY T1 (" + str.tostring(e1_trig, "#") + "%, " + str.tostring(e1_wt, "#") + "%)")
+    e1_done := true
+    in_tqqq := true
+    phase   := 1
+
+// Tier 2
+if n_entry >= 2 and enterTier(e2_trig, e2_wt, e2_done)
+    if in_qqq
+        strategy.close("QQQ", comment="QQQ->TQQQ rotate")
+        in_qqq := false
+    strategy.entry("TQQQ", strategy.long, qty=e2_wt, comment="ENTRY T2 (" + str.tostring(e2_trig, "#") + "%, " + str.tostring(e2_wt, "#") + "%)")
+    e2_done := true
+    in_tqqq := true
+    phase   := 1
+
+// Tier 3
+if n_entry >= 3 and enterTier(e3_trig, e3_wt, e3_done)
+    if in_qqq
+        strategy.close("QQQ", comment="QQQ->TQQQ rotate")
+        in_qqq := false
+    strategy.entry("TQQQ", strategy.long, qty=e3_wt, comment="ENTRY T3 (" + str.tostring(e3_trig, "#") + "%, " + str.tostring(e3_wt, "#") + "%)")
+    e3_done := true
+    in_tqqq := true
+    phase   := 1
+
+// Tier 4
+if n_entry >= 4 and enterTier(e4_trig, e4_wt, e4_done)
+    if in_qqq
+        strategy.close("QQQ", comment="QQQ->TQQQ rotate")
+        in_qqq := false
+    strategy.entry("TQQQ", strategy.long, qty=e4_wt, comment="ENTRY T4 (" + str.tostring(e4_trig, "#") + "%, " + str.tostring(e4_wt, "#") + "%)")
+    e4_done := true
+    in_tqqq := true
+    phase   := 1
+
+// =============================================================================
+// PLOTS & VISUALS
+// =============================================================================
+plot(ema, "200 EMA", color=color.orange, linewidth=2)
+
+// Distance-based background tint
+bg = dist >= x_trig ? color.new(color.red, 85) :
+     dist <= e2_trig ? color.new(color.green, 80) :
+     dist <= e1_trig ? color.new(color.green, 90) : na
+bgcolor(bg, title="Zone tint")
+
+// Entry / exit markers
+plotshape(exit_signal, title="Exit->Cash", style=shape.triangledown, location=location.abovebar,
+     color=color.red, size=size.small, text="EXIT")
+plotshape(redeploy, title="Cash->QQQ", style=shape.circle, location=location.belowbar,
+     color=color.blue, size=size.tiny, text="QQQ")
+
+// Phase / distance readout table
+var table tbl = table.new(position.top_right, 2, 5, border_width=1)
+if barstate.islast
+    phase_txt = phase == 1 ? "IN TQQQ" : phase == 2 ? "CASH (waiting)" : "QQQ baseline"
+    table.cell(tbl, 0, 0, "EMA Dist %", text_color=color.white, bgcolor=color.new(color.gray, 20))
+    table.cell(tbl, 1, 0, str.tostring(dist, "#.##") + "%", text_color=color.white, bgcolor=color.new(color.gray, 20))
+    table.cell(tbl, 0, 1, "Phase", text_color=color.white, bgcolor=color.new(color.gray, 20))
+    table.cell(tbl, 1, 1, phase_txt, text_color=color.white, bgcolor=color.new(color.gray, 20))
+    table.cell(tbl, 0, 2, "Entry tiers hit", text_color=color.white, bgcolor=color.new(color.gray, 40))
+    et_hit = (e1_done?1:0) + (e2_done?1:0) + (e3_done?1:0) + (e4_done?1:0)
+    table.cell(tbl, 1, 2, str.tostring(et_hit), text_color=color.white, bgcolor=color.new(color.gray, 40))
+    table.cell(tbl, 0, 3, "Exit armed", text_color=color.white, bgcolor=color.new(color.gray, 20))
+    table.cell(tbl, 1, 3, exit_armed ? "yes" : "no", text_color=color.white, bgcolor=color.new(color.gray, 20))
+    table.cell(tbl, 0, 4, "Exit price ref", text_color=color.white, bgcolor=color.new(color.gray, 40))
+    table.cell(tbl, 1, 4, na(exit_price) ? "-" : str.tostring(exit_price, "#.##"), text_color=color.white, bgcolor=color.new(color.gray, 40))

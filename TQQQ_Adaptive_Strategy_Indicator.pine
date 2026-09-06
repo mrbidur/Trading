@@ -1,0 +1,462 @@
+// This Pine Script™ source is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+
+//@version=5
+indicator("TQQQ Dynamic Cash-Adaptive Tranche Strategy", 
+     overlay=true, 
+     max_labels_count=500, 
+     max_lines_count=500,
+     max_bars_back=5000)
+
+// =============================================================================
+// INPUTS — All configurable parameters matching the backtest engine (v2.3)
+// =============================================================================
+
+// --- Contributions ---
+grp_contrib = "Weekly Contributions"
+base_deposit     = input.float(200.0, "Base Weekly Deposit ($)", group=grp_contrib, minval=0)
+ob_deposit       = input.float(100.0, "Overbought Weekly Deposit ($)", group=grp_contrib, minval=0)
+tranche_deposit  = input.float(400.0, "Tranche Buy Deposit ($)", group=grp_contrib, minval=0)
+
+// --- EMA & Harvest ---
+grp_harvest = "Profit Harvest Settings"
+ema_period       = input.int(200, "EMA Period (days)", group=grp_harvest, minval=5)
+harvest_dist_pct = input.float(40.0, "Profit Harvest Distance (%)", group=grp_harvest)
+hysteresis_pct   = input.float(30.0, "Hysteresis Reset Buffer (%)", group=grp_harvest)
+scale_out_pct    = input.float(70.0, "Initial Scale-Out (%)", group=grp_harvest, minval=1, maxval=100)
+step_increment   = input.float(10.0, "Step Trigger Increment (%)", group=grp_harvest, minval=0.1)
+step_sell_pct    = input.float(10.0, "Step Scale-Out Share (%)", group=grp_harvest, minval=0.1, maxval=100)
+
+// --- Tranches ---
+grp_tranche = "Tranche Dip-Buy Settings"
+t1_threshold     = input.float(-25.0, "Tranche 1 Threshold (%)", group=grp_tranche)
+t2_threshold     = input.float(-35.0, "Tranche 2 Threshold (%)", group=grp_tranche)
+t3_threshold     = input.float(-45.0, "Tranche 3 Threshold (%)", group=grp_tranche)
+t4_threshold     = input.float(-55.0, "Tranche 4 Threshold (%)", group=grp_tranche)
+t5_threshold     = input.float(-65.0, "Tranche 5 Threshold (%)", group=grp_tranche)
+cash_deploy_pct  = input.float(20.0, "Cash Deploy per Tranche (%)", group=grp_tranche, minval=1, maxval=100)
+
+// --- Adaptive ---
+grp_adaptive = "Adaptive Threshold Mode"
+adaptive_enabled = input.bool(true, "Enable Adaptive Mode", group=grp_adaptive)
+n_harvest_target = input.int(3, "Consecutive Harvest Target", group=grp_adaptive, minval=1)
+adaptive_t1      = input.float(-20.0, "Adaptive Tranche 1 (%)", group=grp_adaptive)
+
+// --- Cash Yield ---
+grp_yield = "Cash Yield"
+cash_apy         = input.float(4.5, "Cash Buffer APY (%)", group=grp_yield, minval=0)
+
+// --- Display ---
+grp_display = "Display Settings"
+show_ema         = input.bool(true, "Show 200 EMA", group=grp_display)
+show_markers     = input.bool(true, "Show Trade Markers", group=grp_display)
+show_dist_bands  = input.bool(true, "Show +40%/+30% EMA Distance Bands", group=grp_display)
+
+// =============================================================================
+// EMA CALCULATION
+// =============================================================================
+ema200 = ta.ema(close, ema_period)
+
+// =============================================================================
+// CORE STATE MACHINE VARIABLES (persistent across bars)
+// =============================================================================
+var bool   in_overbought       = false
+var int    n_harvest            = 0
+var float  swing_high_peak     = 0.0
+var float  cash_buffer          = 0.0
+var float  peak_cash_buffer     = 0.0
+var float  total_shares         = 0.0
+var float  total_out_of_pocket  = 0.0
+var bool   t1_triggered         = false
+var bool   t2_triggered         = false
+var bool   t3_triggered         = false
+var bool   t4_triggered         = false
+var bool   t5_triggered         = false
+
+// Step scale-out tracking (which levels have fired this cycle)
+var bool   step1_fired = false  // +50%
+var bool   step2_fired = false  // +60%
+var bool   step3_fired = false  // +70%
+var bool   step4_fired = false  // +80%
+var bool   step5_fired = false  // +90%
+
+// Weekly tracking
+var int    last_deposit_week    = -1
+var int    last_deposit_year    = -1
+var int    last_yield_week      = -1
+var int    last_yield_year      = -1
+var bool   tranche_this_week    = false
+var int    current_week_tracked = -1
+var int    current_year_tracked = -1
+
+// =============================================================================
+// DERIVED CALCULATIONS
+// =============================================================================
+dist_pct = ema200 > 0 ? ((close - ema200) / ema200) * 100.0 : 0.0
+
+// Adaptive threshold
+tau_1 = adaptive_enabled and n_harvest >= n_harvest_target ? adaptive_t1 : t1_threshold
+
+// Pullback from swing high
+pullback_pct = swing_high_peak > 0 ? ((close - swing_high_peak) / swing_high_peak) * 100.0 : 0.0
+
+// Weekly boundary detection
+current_week = weekofyear(time)
+current_year = year(time)
+is_friday = (dayofweek(time) == dayofweek.friday)
+new_week = (current_week != current_week_tracked) or (current_year != current_year_tracked)
+
+// =============================================================================
+// STATE MACHINE EXECUTION (runs every bar — daily evaluation)
+// =============================================================================
+
+// Track current action for this bar
+var string bar_action = "HOLD"
+var float  bar_deposit = 0.0
+bar_action := "HOLD"
+bar_deposit := 0.0
+
+// Reset weekly tranche flag on new week
+if new_week
+    tranche_this_week := false
+    current_week_tracked := current_week
+    current_year_tracked := current_year
+
+// --- PHASE 1: WEEKLY CASH YIELD (Fridays only) ---
+if is_friday and (current_week != last_yield_week or current_year != last_yield_year)
+    cash_buffer := cash_buffer * (1.0 + (cash_apy / 100.0) / 52.0)
+    last_yield_week := current_week
+    last_yield_year := current_year
+
+// --- PHASE 2: HYSTERESIS RESET (daily) ---
+// After harvest, in_overbought stays TRUE until dist_pct drops BELOW +30%
+// ONLY THEN can a new +40% harvest fire
+if in_overbought and dist_pct < hysteresis_pct
+    in_overbought := false
+    // Reset step triggers for next cycle
+    step1_fired := false
+    step2_fired := false
+    step3_fired := false
+    step4_fired := false
+    step5_fired := false
+    // n_harvest NOT reset here
+
+// --- PHASE 3: PROFIT HARVEST (daily — immediate execution) ---
+// Guard: "and not in_overbought" ensures this ONLY fires after hysteresis reset
+if dist_pct >= harvest_dist_pct and not in_overbought
+    in_overbought := true
+    n_harvest := n_harvest + 1
+    swing_high_peak := close
+    
+    // Sell 70% of shares
+    shares_to_sell = total_shares * (scale_out_pct / 100.0)
+    cash_harvested = shares_to_sell * close
+    total_shares := total_shares - shares_to_sell
+    cash_buffer := cash_buffer + cash_harvested
+    
+    // Anchor peak_cash_buffer (LOCKED for this cycle)
+    peak_cash_buffer := cash_buffer
+    
+    // Reset tranche triggers
+    t1_triggered := false
+    t2_triggered := false
+    t3_triggered := false
+    t4_triggered := false
+    t5_triggered := false
+    
+    // Reset step triggers
+    step1_fired := false
+    step2_fired := false
+    step3_fired := false
+    step4_fired := false
+    step5_fired := false
+    
+    bar_action := "PROFIT TAKE"
+
+else if in_overbought
+    // Update swing high
+    swing_high_peak := math.max(swing_high_peak, close)
+    
+    // STEP SCALE-OUTS (daily — immediate)
+    float step1_level = harvest_dist_pct + step_increment * 1
+    float step2_level = harvest_dist_pct + step_increment * 2
+    float step3_level = harvest_dist_pct + step_increment * 3
+    float step4_level = harvest_dist_pct + step_increment * 4
+    float step5_level = harvest_dist_pct + step_increment * 5
+    
+    if dist_pct >= step1_level and not step1_fired
+        step_shares = total_shares * (step_sell_pct / 100.0)
+        cash_buffer := cash_buffer + step_shares * close
+        total_shares := total_shares - step_shares
+        step1_fired := true
+        bar_action := "STEP +50%"
+    else if dist_pct >= step2_level and not step2_fired
+        step_shares = total_shares * (step_sell_pct / 100.0)
+        cash_buffer := cash_buffer + step_shares * close
+        total_shares := total_shares - step_shares
+        step2_fired := true
+        bar_action := "STEP +60%"
+    else if dist_pct >= step3_level and not step3_fired
+        step_shares = total_shares * (step_sell_pct / 100.0)
+        cash_buffer := cash_buffer + step_shares * close
+        total_shares := total_shares - step_shares
+        step3_fired := true
+        bar_action := "STEP +70%"
+    else if dist_pct >= step4_level and not step4_fired
+        step_shares = total_shares * (step_sell_pct / 100.0)
+        cash_buffer := cash_buffer + step_shares * close
+        total_shares := total_shares - step_shares
+        step4_fired := true
+        bar_action := "STEP +80%"
+    else if dist_pct >= step5_level and not step5_fired
+        step_shares = total_shares * (step_sell_pct / 100.0)
+        cash_buffer := cash_buffer + step_shares * close
+        total_shares := total_shares - step_shares
+        step5_fired := true
+        bar_action := "STEP +90%"
+
+// --- PHASE 4: TRANCHE DIP-BUY (daily — immediate execution) ---
+// Uses active adaptive threshold
+float active_t1 = tau_1
+bool tranche_fired_today = false
+
+if pullback_pct <= active_t1 and not t1_triggered and swing_high_peak > 0
+    t1_triggered := true
+    tranche_fired_today := true
+    tranche_this_week := true
+    n_harvest := 0
+    deploy_amt = math.min(peak_cash_buffer * (cash_deploy_pct / 100.0), cash_buffer)
+    total_buy = deploy_amt + tranche_deposit
+    total_shares := total_shares + (total_buy / close)
+    cash_buffer := cash_buffer - deploy_amt
+    total_out_of_pocket := total_out_of_pocket + tranche_deposit
+    bar_deposit := tranche_deposit
+    bar_action := "TRANCHE 1"
+
+else if pullback_pct <= t2_threshold and not t2_triggered and t1_triggered and swing_high_peak > 0
+    t2_triggered := true
+    tranche_fired_today := true
+    tranche_this_week := true
+    n_harvest := 0
+    deploy_amt = math.min(peak_cash_buffer * (cash_deploy_pct / 100.0), cash_buffer)
+    total_buy = deploy_amt + tranche_deposit
+    total_shares := total_shares + (total_buy / close)
+    cash_buffer := cash_buffer - deploy_amt
+    total_out_of_pocket := total_out_of_pocket + tranche_deposit
+    bar_deposit := tranche_deposit
+    bar_action := "TRANCHE 2"
+
+else if pullback_pct <= t3_threshold and not t3_triggered and t2_triggered and swing_high_peak > 0
+    t3_triggered := true
+    tranche_fired_today := true
+    tranche_this_week := true
+    n_harvest := 0
+    deploy_amt = math.min(peak_cash_buffer * (cash_deploy_pct / 100.0), cash_buffer)
+    total_buy = deploy_amt + tranche_deposit
+    total_shares := total_shares + (total_buy / close)
+    cash_buffer := cash_buffer - deploy_amt
+    total_out_of_pocket := total_out_of_pocket + tranche_deposit
+    bar_deposit := tranche_deposit
+    bar_action := "TRANCHE 3"
+
+else if pullback_pct <= t4_threshold and not t4_triggered and t3_triggered and swing_high_peak > 0
+    t4_triggered := true
+    tranche_fired_today := true
+    tranche_this_week := true
+    n_harvest := 0
+    deploy_amt = math.min(peak_cash_buffer * (cash_deploy_pct / 100.0), cash_buffer)
+    total_buy = deploy_amt + tranche_deposit
+    total_shares := total_shares + (total_buy / close)
+    cash_buffer := cash_buffer - deploy_amt
+    total_out_of_pocket := total_out_of_pocket + tranche_deposit
+    bar_deposit := tranche_deposit
+    bar_action := "TRANCHE 4"
+
+else if pullback_pct <= t5_threshold and not t5_triggered and t4_triggered and swing_high_peak > 0
+    t5_triggered := true
+    tranche_fired_today := true
+    tranche_this_week := true
+    n_harvest := 0
+    deploy_amt = math.min(peak_cash_buffer * (cash_deploy_pct / 100.0), cash_buffer)
+    total_buy = deploy_amt + tranche_deposit
+    total_shares := total_shares + (total_buy / close)
+    cash_buffer := cash_buffer - deploy_amt
+    total_out_of_pocket := total_out_of_pocket + tranche_deposit
+    bar_deposit := tranche_deposit
+    bar_action := "TRANCHE 5"
+
+// --- PHASE 5: FRIDAY DCA DEPOSIT (strictly Friday only) ---
+if is_friday and (current_week != last_deposit_week or current_year != last_deposit_year)
+    last_deposit_week := current_week
+    last_deposit_year := current_year
+    
+    float friday_deposit = 0.0
+    if tranche_this_week
+        friday_deposit := 0.0  // Already deposited $400 via tranche
+    else if in_overbought
+        friday_deposit := ob_deposit
+    else
+        friday_deposit := base_deposit
+    
+    if friday_deposit > 0
+        total_shares := total_shares + (friday_deposit / close)
+        total_out_of_pocket := total_out_of_pocket + friday_deposit
+        bar_deposit := bar_deposit + friday_deposit
+        if bar_action == "HOLD"
+            bar_action := in_overbought ? "DCA (OB)" : "DCA"
+
+// =============================================================================
+// PORTFOLIO VALUATION
+// =============================================================================
+portfolio_value = (total_shares * close) + cash_buffer
+
+// =============================================================================
+// PLOT: EMA LINE
+// =============================================================================
+plot(show_ema ? ema200 : na, "200 EMA", color=color.new(color.orange, 0), linewidth=2)
+
+// =============================================================================
+// PLOT: +40% and +30% EMA DISTANCE BANDS (visual harvest/reset zones)
+// =============================================================================
+ema_harvest_line = ema200 * (1 + harvest_dist_pct / 100.0)
+ema_hysteresis_line = ema200 * (1 + hysteresis_pct / 100.0)
+
+plot(show_dist_bands ? ema_harvest_line : na, "+40% Harvest Zone", 
+     color=color.new(color.red, 60), linewidth=1, style=plot.style_line)
+plot(show_dist_bands ? ema_hysteresis_line : na, "+30% Hysteresis Reset", 
+     color=color.new(color.yellow, 60), linewidth=1, style=plot.style_line)
+
+// =============================================================================
+// PLOT: TRADE MARKERS
+// =============================================================================
+// Profit Take markers (red triangle down above bar)
+plotshape(show_markers and bar_action == "PROFIT TAKE" ? true : false,
+     title="Profit Take", style=shape.triangledown, location=location.abovebar,
+     color=color.red, size=size.normal, text="HARVEST")
+
+// Step Scale-Out markers (orange diamond above bar)
+is_step = str.contains(bar_action, "STEP")
+plotshape(show_markers and is_step ? true : false,
+     title="Step Scale-Out", style=shape.diamond, location=location.abovebar,
+     color=color.orange, size=size.small, text="STEP")
+
+// Tranche Buy markers (green triangle up below bar)
+is_tranche = str.contains(bar_action, "TRANCHE")
+plotshape(show_markers and is_tranche ? true : false,
+     title="Tranche Buy", style=shape.triangleup, location=location.belowbar,
+     color=color.green, size=size.normal, text="TRANCHE")
+
+// DCA markers (blue circle below bar — only on Fridays with deposit)
+is_dca = str.contains(bar_action, "DCA")
+plotshape(show_markers and is_dca ? true : false,
+     title="Weekly DCA", style=shape.circle, location=location.belowbar,
+     color=color.new(color.blue, 40), size=size.tiny)
+
+// Hysteresis Reset visual (yellow cross when overbought resets)
+was_overbought = in_overbought[1] and not in_overbought
+plotshape(show_markers and was_overbought ? true : false,
+     title="Hysteresis Reset", style=shape.xcross, location=location.belowbar,
+     color=color.yellow, size=size.small, text="RESET")
+
+// =============================================================================
+// PLOT: DATA WINDOW OUTPUTS (visible in tooltip/data window on hover)
+// These plots display the complete strategy state for each candle
+// =============================================================================
+
+// --- Section 1: Price & EMA Distance ---
+plot(dist_pct, "EMA Distance %", color=color.new(color.purple, 100), display=display.data_window)
+plot(ema200, "200 EMA Value", color=color.new(color.orange, 100), display=display.data_window)
+
+// --- Section 2: Strategy State ---
+// Encode action as numeric for data window (also shown via markers)
+float action_code = bar_action == "PROFIT TAKE" ? 5.0 :
+     is_step ? 4.0 :
+     is_tranche ? 3.0 :
+     is_dca ? 2.0 :
+     bar_action == "HOLD" ? 0.0 : 1.0
+plot(action_code, "Action Code (5=Harvest,4=Step,3=Tranche,2=DCA,0=Hold)", 
+     color=color.new(color.white, 100), display=display.data_window)
+plot(in_overbought ? 1 : 0, "Overbought Flag (1=True)", 
+     color=color.new(color.white, 100), display=display.data_window)
+plot(n_harvest, "N_Harvest Counter", 
+     color=color.new(color.white, 100), display=display.data_window)
+
+// --- Section 3: Capital Deployment Metrics ---
+plot(cash_buffer, "Cash Buffer ($)", 
+     color=color.new(color.teal, 100), display=display.data_window)
+plot(peak_cash_buffer, "Peak Cash Buffer (Anchored) ($)", 
+     color=color.new(color.teal, 100), display=display.data_window)
+plot(bar_deposit, "Deposit This Bar ($)", 
+     color=color.new(color.teal, 100), display=display.data_window)
+plot(total_out_of_pocket, "Total Out-of-Pocket ($)", 
+     color=color.new(color.teal, 100), display=display.data_window)
+
+// --- Section 4: Profit Booking & Re-entry Status ---
+plot(harvest_dist_pct - dist_pct, "Distance to Harvest Trigger (%)", 
+     color=color.new(color.white, 100), display=display.data_window)
+plot(tau_1, "Active Tranche 1 Threshold (%)", 
+     color=color.new(color.white, 100), display=display.data_window)
+plot(pullback_pct, "Pullback from Peak (%)", 
+     color=color.new(color.white, 100), display=display.data_window)
+plot(swing_high_peak, "Swing High Peak ($)", 
+     color=color.new(color.white, 100), display=display.data_window)
+
+// --- Section 5: Portfolio ---
+plot(total_shares, "Total Shares Held", 
+     color=color.new(color.white, 100), display=display.data_window)
+plot(portfolio_value, "Portfolio Value ($)", 
+     color=color.new(color.lime, 100), display=display.data_window)
+
+// =============================================================================
+// BACKGROUND COLORING (subtle regime visualization)
+// =============================================================================
+bgcolor(in_overbought ? color.new(color.red, 92) : na, title="Overbought Regime")
+bgcolor(is_tranche ? color.new(color.green, 88) : na, title="Tranche Buy Day")
+bgcolor(bar_action == "PROFIT TAKE" ? color.new(color.red, 85) : na, title="Harvest Day")
+
+// =============================================================================
+// TABLE: Live Strategy Dashboard (top-right corner)
+// =============================================================================
+var table dash = table.new(position.top_right, 2, 10, 
+     bgcolor=color.new(color.black, 20), border_width=1, border_color=color.gray)
+
+if barstate.islast
+    table.cell(dash, 0, 0, "Metric", text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, 0, "Value", text_color=color.gray, text_size=size.small)
+    
+    table.cell(dash, 0, 1, "EMA Dist %", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 1, str.tostring(dist_pct, "#.##") + "%", 
+         text_color=dist_pct >= harvest_dist_pct ? color.red : 
+         dist_pct >= hysteresis_pct ? color.orange : color.green, text_size=size.small)
+    
+    table.cell(dash, 0, 2, "State", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 2, in_overbought ? "OVERBOUGHT" : "NORMAL", 
+         text_color=in_overbought ? color.red : color.green, text_size=size.small)
+    
+    table.cell(dash, 0, 3, "N_Harvest", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 3, str.tostring(n_harvest), 
+         text_color=n_harvest >= n_harvest_target ? color.yellow : color.white, text_size=size.small)
+    
+    table.cell(dash, 0, 4, "Tau_1 Trigger", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 4, str.tostring(tau_1, "#.#") + "%", 
+         text_color=tau_1 == adaptive_t1 ? color.yellow : color.white, text_size=size.small)
+    
+    table.cell(dash, 0, 5, "Cash Buffer", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 5, "$" + str.tostring(cash_buffer, "#,###.##"), 
+         text_color=color.teal, text_size=size.small)
+    
+    table.cell(dash, 0, 6, "Peak Cash", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 6, "$" + str.tostring(peak_cash_buffer, "#,###.##"), 
+         text_color=color.teal, text_size=size.small)
+    
+    table.cell(dash, 0, 7, "Total Shares", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 7, str.tostring(total_shares, "#,###.##"), 
+         text_color=color.white, text_size=size.small)
+    
+    table.cell(dash, 0, 8, "Portfolio $", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 8, "$" + str.tostring(portfolio_value, "#,###.##"), 
+         text_color=color.lime, text_size=size.small)
+    
+    table.cell(dash, 0, 9, "Pullback %", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 9, str.tostring(pullback_pct, "#.##") + "%", 
+         text_color=pullback_pct <= tau_1 ? color.green : color.white, text_size=size.small)
