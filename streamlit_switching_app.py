@@ -131,6 +131,8 @@ def run_backtest(
     xover_trigger_pct: float = 5.0,               # cross from below EMA to >= +X% above → switch ALL into TQQQ
     xover_reset_pct: float = 0.0,                 # switch re-arms once dist falls back below this (must re-cross from below)
     xover_route_dca: bool = True,                 # while switched-on, route weekly DCA into TQQQ (else into CASH)
+    xover_exit_enabled: bool = True,              # enable the matching "switch back to QQQ" exit
+    xover_exit_pct: float = 0.0,                  # switch TQQQ→QQQ when dist <= this % of EMA (0 = at EMA, -5 = 5% below)
 ) -> pd.DataFrame:
     """
     Phased two-way rotation with FIFO tax lots and delayed QQQ re-deployment.
@@ -158,6 +160,12 @@ def run_backtest(
       re-arms only after dist falls back below xover_reset_pct (so it must dip
       below the EMA band and cross up again to fire a second time). This is a
       momentum/trend overlay and is independent of the dip-buying entry tiers.
+
+    SWITCH BACK TO QQQ (matching trend exit, optional):
+      While switched-on, if TQQQ's EMA distance drops to <= xover_exit_pct
+      (e.g. 0% = at the EMA, -5% = 5% below it), sell ALL TQQQ (FIFO, taxed) and
+      move the proceeds straight into QQQ. This is the trend-following unwind for
+      the +X% cross-up entry.
 
     CASH is flat (no yield). Fees (flat + %) on every buy/sell/shift.
     """
@@ -298,7 +306,32 @@ def run_backtest(
             # Re-arm once price falls back below the reset band (needs a fresh cross-up)
             if not xover_armed and dist < xover_reset_pct:
                 xover_armed = True
-            # Switch turns "off" (stops routing DCA to TQQQ) once back under reset band
+
+            # --- SWITCH BACK TO QQQ: while on, if price falls to <= exit % of EMA, sell all TQQQ → QQQ ---
+            if xover_exit_enabled and xover_on and dist <= xover_exit_pct and shares_of(tqqq_lots) > 0:
+                t_sh_all = shares_of(tqqq_lots)
+                g, gain_t, tax_t = sell_fifo(tqqq_lots, t_sh_all, tp, cur_date,
+                                             marginal_rate, lt_discount_pct)
+                f_t = fee_on(g)
+                net_t = max(g - f_t - tax_t, 0.0)
+                total_fees += f_t
+                total_tax += tax_t
+                fee_today += f_t
+                tax_today += tax_t
+                # Deploy proceeds straight into QQQ (net of the buy fee)
+                sh, notional, fee = buy_shares_net(net_t, qp)
+                if sh > 0:
+                    qqq_lots.append([cur_date, sh, notional / sh])
+                    total_fees += fee
+                    fee_today += fee
+                    transfer += notional
+                else:
+                    cash += net_t  # too small to buy — leave in cash
+                xover_on = False
+                lbl = f"SWITCH→QQQ (dist ≤{xover_exit_pct:.0f}%, sold TQQQ ${g:,.0f}, tax ${tax_t:,.0f})"
+                action = lbl if action in ["HOLD", "DCA", "DCA→TQQQ"] else f"{action} + {lbl}"
+
+            # Switch also turns "off" (stops routing DCA to TQQQ) once back under reset band
             if xover_on and dist < xover_reset_pct:
                 xover_on = False
             # Detect a genuine cross-up: previous bar was below EMA (dist < 0) and now
@@ -514,6 +547,7 @@ def compute_metrics(df: pd.DataFrame) -> dict:
     pullback_deploys = df["Action"].str.contains(r"pullback").sum()
     time_deploys = df["Action"].str.contains(r"time limit").sum()
     xover_switches = df["Action"].str.contains("SWITCH→TQQQ").sum()
+    xover_exits = df["Action"].str.contains("SWITCH→QQQ").sum()
 
     total_fees = df["Cumulative Fees ($)"].values[-1] if "Cumulative Fees ($)" in df.columns else 0.0
     total_tax = df["Cumulative Tax ($)"].values[-1] if "Cumulative Tax ($)" in df.columns else 0.0
@@ -528,7 +562,7 @@ def compute_metrics(df: pd.DataFrame) -> dict:
         alpha=final_s - final_b, alpha_pct=(final_s/final_b-1)*100 if final_b>0 else 0,
         entries=entries, exits=exits, resets=resets, qqq_deploys=qqq_deploys,
         pullback_deploys=pullback_deploys, time_deploys=time_deploys,
-        xover_switches=xover_switches,
+        xover_switches=xover_switches, xover_exits=xover_exits,
         total_fees=total_fees, total_tax=total_tax, n_trades=n_trades,
         fee_drag_pct=fee_drag_pct, tax_drag_pct=tax_drag_pct,
     )
@@ -613,6 +647,11 @@ xover_reset_pct = st.sidebar.slider("Switch Reset (% — re-arm below this)", -2
     help="The switch re-arms (and DCA routing turns off) once distance falls back below this level, so it must cross up again to re-fire.")
 xover_route_dca = st.sidebar.checkbox("Route weekly DCA into TQQQ while switched on", value=True,
     help="If on, weekly contributions buy TQQQ directly while the switch is active; otherwise they accumulate in cash.")
+st.sidebar.caption("↩️ Switch BACK to QQQ when price falls to/below the EMA:")
+xover_exit_enabled = st.sidebar.checkbox("Enable switch back to QQQ", value=True,
+    help="After the +X% cross-up entry, sell all TQQQ into QQQ once price drops to the level below.")
+xover_exit_pct = st.sidebar.slider("Switch-Back Trigger (% of EMA)", -30.0, 5.0, 0.0, 0.5,
+    help="Sell TQQQ→QQQ when distance falls to this % of the EMA. 0% = at the EMA, -5% = 5% below it.")
 
 # --- POST-EXIT CASH HOLDING BEFORE QQQ ---
 st.sidebar.markdown("---")
@@ -635,9 +674,9 @@ st.title("🔁 QQQ/TQQQ/CASH Two-Way Rotation — FIFO Tax + Fees + Delayed QQQ"
 entry_str = " | ".join([f"{t:.0f}%→{w:.0f}%port" for t, w in entry_tiers])
 exit_str = " | ".join([f"+{t:.0f}%→cash {w:.0f}%(reset@{r:.0f}%)" for t, w, r in exit_tiers])
 fee_str = f"{fee_pct:.2f}% + ${fee_flat:.2f}/trade"
-xover_str = (f"ON: cross +{xover_trigger_pct:.0f}% → all-in TQQQ"
-             + (", DCA→TQQQ" if xover_route_dca else "")
-             + f" (re-arm <{xover_reset_pct:.0f}%)") if xover_enabled else "OFF"
+xover_str = (f"ON: in @+{xover_trigger_pct:.0f}%"
+             + (f" / out @{xover_exit_pct:.0f}%→QQQ" if xover_exit_enabled else " / no auto-exit")
+             + (", DCA→TQQQ" if xover_route_dca else "")) if xover_enabled else "OFF"
 st.caption(
     f"DCA ${weekly_dca}/wk → CASH (flat) | Fees: {fee_str} | Tax: {marginal_rate:.0f}% "
     f"(LT >365d −{lt_discount_pct:.0f}%) | Cash→QQQ: pullback ≥{pullback_pct}% OR ≤{cash_hold_weeks}wk | "
@@ -658,6 +697,7 @@ if run:
                 marginal_rate, lt_discount_pct, cash_hold_weeks, pullback_pct,
                 fee_flat, fee_pct,
                 xover_enabled, xover_trigger_pct, xover_reset_pct, xover_route_dca,
+                xover_exit_enabled, xover_exit_pct,
             )
 
         if results.empty:
@@ -697,6 +737,8 @@ if run:
                          help="Redeployments triggered by the max-hold-weeks fallback")
             r5[2].metric("🚀 Cross-Up Switches", m['xover_switches'],
                          help="Times the EMA cross-up moved the whole portfolio into TQQQ")
+            r5[3].metric("↩️ Switch-Back to QQQ", m['xover_exits'],
+                         help="Times the trend exit sold TQQQ back into QQQ when price fell to/below the EMA")
 
             st.markdown("---")
             st.subheader("📈 Portfolio Growth")
@@ -788,6 +830,11 @@ else:
     below** its EMA up to **+X%** above it (default **+5%**), the whole portfolio
     (cash + QQQ) is moved into TQQQ, and ongoing weekly DCA can optionally be routed
     straight into TQQQ. The switch re-arms only after distance falls back below your
-    reset level, so it must dip and cross up again to re-fire. Everything —
-    the trigger %, reset %, DCA routing, and the on/off toggle — is customizable.
+    reset level, so it must dip and cross up again to re-fire.
+
+    **Switch back to QQQ (trend exit):** once in TQQQ, if price falls to **≤ your
+    switch-back %** of the EMA (e.g. **0%** = at the EMA, **−5%** = 5% below it),
+    all TQQQ is sold (FIFO-taxed) and moved into QQQ. Everything —
+    the entry %, switch-back %, reset %, DCA routing, and both on/off toggles — is
+    customizable.
     """)
